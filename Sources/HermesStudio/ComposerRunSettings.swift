@@ -12,7 +12,7 @@ struct ComposerRunSettingsButton: View {
                 Text(studio.runSettings?.editApproval.map { approvalTitle($0.value, fallback: $0.name) } ?? "权限")
                     .fixedSize()
                 Text("·").accessibilityHidden(true)
-                Text(studio.runSettings?.model?.name ?? (studio.modelName.isEmpty ? "默认模型" : studio.modelName))
+                Text(studio.composerModelName)
                     .lineLimit(1)
                 if let effort = studio.runSettings?.effort {
                     Text("·").accessibilityHidden(true)
@@ -27,7 +27,7 @@ struct ComposerRunSettingsButton: View {
         .accessibilityLabel("运行设置")
         .accessibilityValue([
             studio.runSettings?.editApproval.map { approvalTitle($0.value, fallback: $0.name) },
-            studio.runSettings?.model?.name ?? studio.modelName,
+            studio.composerModelName,
             studio.runSettings?.effort.map { effortLabel($0.value) }
         ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "，"))
         .help(studio.runningConversation == nil ? "设置当前对话的权限、模型与推理强度" : "回复结束后可调整运行设置")

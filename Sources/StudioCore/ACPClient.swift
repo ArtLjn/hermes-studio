@@ -152,7 +152,8 @@ public final class TurnControl: @unchecked Sendable {
 }
 
 extension HermesRuntime {
-    public func warm(home: URL, conversation: Conversation?, workspace: URL? = nil, skillIDs: Set<String>? = nil) {
+    public func warm(home: URL, conversation: Conversation?, workspace: URL? = nil, skillIDs: Set<String>? = nil,
+        onSettings: (@Sendable (String, HermesRunSettings) -> Void)? = nil) {
         workers.queue.async {
             do {
                 let worker = try workers.connection(runtime: self, home: home, skillIDs: skillIDs,
@@ -160,6 +161,7 @@ extension HermesRuntime {
                 if let id = conversation?.sessionID {
                     let directory = try self.sessionDirectory(home: home, workspace: workspace)
                     _ = try worker.session(existing: id, workspace: directory)
+                    if let settings = worker.rpc.settings[id] { onSettings?(id, settings) }
                 }
                 workers.keepWarm(home: home)
             } catch {

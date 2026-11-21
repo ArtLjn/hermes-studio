@@ -139,8 +139,8 @@ struct ManagementPane: View {
                 VStack(alignment: .leading, spacing: 26) {
                     switch page {
                     case .overview:
-                        WorkbenchOverview(studio: studio, roles: orderedRoles, create: create,
-                            openRoles: { navigate(.roles) }, openProjects: { navigate(.projects) },
+                        WorkbenchOverview(studio: studio, create: create,
+                            openProjects: { navigate(.projects) },
                             openHistory: { navigate(.conversations) })
                     case .roles: catalog
                     case .projects: ProjectPane(studio: studio, create: createProject)

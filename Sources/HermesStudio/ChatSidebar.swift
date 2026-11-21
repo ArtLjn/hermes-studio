@@ -51,7 +51,8 @@ struct ChatSidebar: View {
             .padding(.horizontal, 8)
 
             if let role = studio.role {
-                SidebarRoleMenu(studio: studio, role: role)
+                RolePickerButton(roles: studio.roles, selected: role, store: studio.store,
+                    select: studio.select as (Role) -> Void)
                     .padding(.horizontal, 16)
                     .padding(.top, 2)
                     .padding(.bottom, 10)
@@ -318,43 +319,5 @@ private struct SidebarEntry<Title: View, Accessory: View>: View {
         if droppedOn { return StudioPalette.accent.opacity(0.18) }
         if selected { return StudioPalette.selected }
         return hovered ? StudioPalette.line : .clear
-    }
-}
-
-struct SidebarRoleMenu: View {
-    @ObservedObject var studio: StudioModel
-    let role: Role
-    var compact = false
-
-    var body: some View {
-        Menu {
-            ForEach(studio.roles) { candidate in
-                Button(candidate.name, systemImage: candidate.id == role.id ? "checkmark" : roleSymbol(candidate)) {
-                    if candidate.id != role.id { studio.select(candidate) }
-                }
-            }
-        } label: {
-            if compact {
-                RolePortrait(role: role, store: studio.store, size: 23)
-                    .frame(width: 36, height: 34)
-            } else {
-                HStack(spacing: 7) {
-                    RolePortrait(role: role, store: studio.store, size: 21)
-                    Text(role.name)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(StudioPalette.ink)
-                        .lineLimit(1)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(StudioPalette.muted)
-                }
-                .frame(height: 29)
-            }
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize(horizontal: compact, vertical: true)
-        .accessibilityLabel("当前角色 \(role.name)，切换角色")
-        .help("切换角色")
     }
 }

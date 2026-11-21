@@ -28,6 +28,7 @@ final class StudioModel: ObservableObject {
     @Published var selectedSkill: HermesSkill?
     @Published var error: String?
     @Published var draft = ""
+    @Published var workbenchDraft = ""
     @Published private(set) var loadingRunSettings = false
     @Published private var runSettingsBySession: [String: HermesRunSettings] = [:]
     @Published private var preparedRun: (context: UUID, sessionID: String)?
@@ -116,6 +117,11 @@ final class StudioModel: ObservableObject {
     }
     var runSettingsContext: UUID { draftContext }
     var runSettings: HermesRunSettings? { composerSessionID.flatMap { runSettingsBySession[$0] } }
+    var composerModelName: String {
+        if let model = runSettings?.model { return model.name }
+        if conversation?.sessionID != nil { return "会话模型" }
+        return modelName.isEmpty ? "默认模型" : modelName
+    }
     var runSettingsError: String? { runSettingsFailure?.context == draftContext ? runSettingsFailure?.message : nil }
     private var composerSessionID: String? {
         conversation?.sessionID ?? (preparedRun?.context == draftContext ? preparedRun?.sessionID : nil)
@@ -703,8 +709,14 @@ final class StudioModel: ObservableObject {
     private func prewarm() {
         guard !showManagement, let role else { return }
         guard projectID == nil || project != nil else { return }
+        let revision = runtimeRevision
         backend?.warm(home: store.runtime(for: role.id), conversation: conversation, workspace: project?.directory,
-            skillIDs: role.skillIDs)
+            skillIDs: role.skillIDs) { [weak self] id, settings in
+                Task { @MainActor in
+                    guard let self, self.runtimeRevision == revision, self.runSettingsBySession[id] == nil else { return }
+                    self.runSettingsBySession[id] = settings
+                }
+            }
     }
 
     private func reloadFiles(for roleID: UUID) throws {

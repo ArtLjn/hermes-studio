@@ -357,6 +357,15 @@ final class ComposerAndRuntimeTests: XCTestCase {
         XCTAssertEqual(applied?.model?.value, chosenModel)
         XCTAssertEqual(applied?.effort?.value, option.id)
         XCTAssertTrue(answer.contains("RUN-SETTINGS-OK"), answer)
+
+        let reopened = expectation(description: "恢复会话时读取实际模型")
+        runtime.reset(home: home)
+        runtime.warm(home: home, conversation: thread) { id, settings in
+            XCTAssertEqual(id, prepared.id)
+            XCTAssertEqual(settings.model?.value, chosenModel)
+            reopened.fulfill()
+        }
+        await fulfillment(of: [reopened], timeout: 20)
     }
 
     func testRunSettingsUseAdvertisedEditApprovalOptions() throws {

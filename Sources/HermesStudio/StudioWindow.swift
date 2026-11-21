@@ -104,7 +104,10 @@ struct StudioWindow: View {
             if !studio.showManagement && !showSidebar {
                 StudioRule().padding(.horizontal, 12).padding(.vertical, 4)
                 railButton("新对话", symbol: "square.and.pencil", action: studio.newConversation)
-                if let role = studio.role { SidebarRoleMenu(studio: studio, role: role, compact: true) }
+                if let role = studio.role {
+                    RolePickerButton(roles: studio.roles, selected: role, store: studio.store, compact: true,
+                        select: studio.select as (Role) -> Void)
+                }
             }
             Spacer(minLength: 8)
             HermesStatusButton(studio: studio)
