@@ -90,6 +90,8 @@ public struct Conversation: Codable, Identifiable, Equatable, Sendable {
     public var updated = Date()
     public var sessionID: String?
     public var projectID: UUID?
+    public var pinnedAt: Date?
+    public var archivedAt: Date?
     public var messages: [Message] = []
 
     public init(roleID: UUID) { self.roleID = roleID }
@@ -131,6 +133,21 @@ public struct RoleStore: Sendable {
 
     public init(root: URL) { self.root = root }
 
+    public func migrateDataIfNeeded(from legacyRoot: URL) throws {
+        let files = FileManager.default
+        guard !files.fileExists(atPath: root.path), files.fileExists(atPath: legacyRoot.path) else { return }
+        let staging = root.deletingLastPathComponent().appendingPathComponent(".hermesgroup-migration-\(UUID())")
+        defer { try? files.removeItem(at: staging) }
+        try files.copyItem(at: legacyRoot, to: staging)
+        let snapshot = RoleStore(root: staging)
+        try snapshot.relocateProjectPaths(from: legacyRoot, to: root)
+        do {
+            try files.moveItem(at: staging, to: root)
+        } catch CocoaError.fileWriteFileExists {
+            // 另一个实例已完成迁移。
+        }
+    }
+
     public func list() throws -> [Role] { try allRoles().filter { $0.archivedAt == nil } }
 
     public func archivedRoles() throws -> [Role] {
@@ -139,6 +156,7 @@ public struct RoleStore: Sendable {
     }
 
     private func allRoles() throws -> [Role] {
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let directory = root.appendingPathComponent("roles", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         return try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
@@ -224,6 +242,18 @@ public struct RoleStore: Sendable {
         }
     }
 
+    @discardableResult
+    public func trashArchivedRole(_ id: UUID) throws -> URL? {
+        let directory = roleDirectory(id)
+        let role = try read(Role.self, at: directory.appendingPathComponent("role.json"))
+        guard role.archivedAt != nil, role.terminalSource == nil else {
+            throw StudioError.message("只能删除草稿箱里的角色。")
+        }
+        var destination: NSURL?
+        try FileManager.default.trashItem(at: directory, resultingItemURL: &destination)
+        return destination as URL?
+    }
+
     public func runtime(for id: UUID) -> URL {
         roleDirectory(id).appendingPathComponent("runtime", isDirectory: true)
     }
@@ -263,6 +293,30 @@ public struct RoleStore: Sendable {
         conversations.removeAll { $0.id == conversation.id }
         conversations.insert(conversation, at: 0)
         try saveConversations(conversations, for: conversation.roleID)
+    }
+
+    public func setConversationPinned(_ pinned: Bool, id: UUID, for roleID: UUID) throws -> Conversation {
+        try updateConversation(id, for: roleID) { thread in
+            guard thread.archivedAt == nil else { throw StudioError.message("请先恢复这个对话。") }
+            thread.pinnedAt = pinned ? (thread.pinnedAt ?? Date()) : nil
+        }
+    }
+
+    public func setConversationArchived(_ archived: Bool, id: UUID, for roleID: UUID) throws -> Conversation {
+        try updateConversation(id, for: roleID) { thread in
+            thread.archivedAt = archived ? (thread.archivedAt ?? Date()) : nil
+        }
+    }
+
+    private func updateConversation(_ id: UUID, for roleID: UUID,
+        change: (inout Conversation) throws -> Void) throws -> Conversation {
+        var threads = try conversations(for: roleID)
+        guard let index = threads.firstIndex(where: { $0.id == id }) else {
+            throw StudioError.message("找不到这个对话。")
+        }
+        try change(&threads[index])
+        try saveConversations(threads, for: roleID)
+        return threads[index]
     }
 
     func saveConversations(_ conversations: [Conversation], for roleID: UUID) throws {

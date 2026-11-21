@@ -12,13 +12,12 @@ struct ChatTurnRow: View {
     var body: some View {
         let running = activity != nil
         let content = turn.presentation(running: running)
-        let olderFollowUps = turn.messages.filter { $0.isGuidance == true }
-        let execution = content.process.filter { !$0.messages.contains(where: { $0.isGuidance == true }) }
+        let hasInsertion = turn.messages.contains { $0.isGuidance == true }
+        let execution = content.process
         VStack(alignment: .leading, spacing: 15) {
             if let request = turn.request { row(request) }
-            ForEach(olderFollowUps) { row($0) }
             if !execution.isEmpty {
-                if running {
+                if running || hasInsertion {
                     process(execution)
                 } else {
                     DisclosureGroup(isExpanded: $showingProcess) {

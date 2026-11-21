@@ -2,15 +2,6 @@ import AppKit
 import StudioCore
 import SwiftUI
 
-struct QueuedTurn: Identifiable {
-    let id = UUID()
-    let text: String
-    let images: [ImagePayload]
-    let skill: HermesSkill?
-
-    var supportsNativeQueue: Bool { !text.isEmpty && images.isEmpty && skill == nil && !text.hasPrefix("/") }
-}
-
 @MainActor
 final class StudioModel: ObservableObject {
     @Published private(set) var roles: [Role] = []
@@ -24,10 +15,11 @@ final class StudioModel: ObservableObject {
     @Published private(set) var showManagement = true
     @Published private(set) var available = false
     @Published private(set) var modelName = ""
+    @Published private(set) var hermesUpdate: HermesUpdateCheck?
+    @Published private(set) var checkingHermesUpdate = false
     @Published private(set) var terminalHome: URL?
     @Published private(set) var runningConversation: UUID?
-    @Published private var queuedByConversation: [UUID: [QueuedTurn]] = [:]
-    @Published private(set) var submittedFollowUp: UUID?
+    @Published private(set) var insertingMessage: UUID?
     @Published private var permissions: [ToolPermission] = []
     @Published private(set) var activity = ""
     @Published private(set) var skills: [HermesSkill] = []
@@ -47,7 +39,6 @@ final class StudioModel: ObservableObject {
     private var runtimeRevision = UUID()
     private var draftContext = UUID()
     private var turnControl: TurnControl?
-    private var rejectedFollowUp: UUID?
     private var drafts: [UUID: String] = [:]
     private var imageDrafts: [UUID: [ImagePayload]] = [:]
     private var skillDrafts: [UUID: HermesSkill] = [:]
@@ -55,15 +46,29 @@ final class StudioModel: ObservableObject {
     private var selectedThreads: [UUID: UUID] = [:]
 
     init() {
-        let home = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let root = ProcessInfo.processInfo.environment["HERMES_STUDIO_DATA_DIR"].map {
-            URL(fileURLWithPath: $0, isDirectory: true)
-        } ?? home.appendingPathComponent("Hermes Studio", isDirectory: true)
-        store = RoleStore(root: root)
+        let files = FileManager.default
+        let legacy = files.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Hermes Studio", isDirectory: true)
+        let defaultRoot = files.homeDirectoryForCurrentUser.appendingPathComponent("hermesgroup", isDirectory: true)
+        let migrationError: String?
+        if let override = ProcessInfo.processInfo.environment["HERMES_STUDIO_DATA_DIR"], !override.isEmpty {
+            store = RoleStore(root: URL(fileURLWithPath: override, isDirectory: true))
+            migrationError = nil
+        } else {
+            let destination = RoleStore(root: defaultRoot)
+            do {
+                try destination.migrateDataIfNeeded(from: legacy)
+                store = destination
+                migrationError = nil
+            } catch {
+                store = RoleStore(root: legacy)
+                migrationError = "迁移到 ~/hermesgroup 失败，正在使用原数据目录。\(error.localizedDescription)"
+            }
+        }
         do {
             roles = try store.list()
             archivedRoles = try store.archivedRoles()
-            let seeded = root.appendingPathComponent(".default-roles-initialized")
+            let seeded = store.root.appendingPathComponent(".default-roles-initialized")
             if roles.isEmpty && archivedRoles.isEmpty && !FileManager.default.fileExists(atPath: seeded.path) {
                 for template in [RoleTemplate.general, .engineering, .writing] {
                     let role = Role(name: template.name, summary: template.description, template: template)
@@ -83,22 +88,31 @@ final class StudioModel: ObservableObject {
         }
         refreshArchive()
         refreshRuntime()
+        if let migrationError { error = migrationError }
     }
 
     var role: Role? { roles.first { $0.id == roleID } }
     var inputHistoryHome: URL? {
-        role?.terminalSource.map { URL(fileURLWithPath: $0, isDirectory: true) } ?? terminalHome
+        guard projectID == nil, let source = role?.terminalSource else { return nil }
+        return URL(fileURLWithPath: source, isDirectory: true)
     }
     var projects: [StudioProject] { roleID.map { projects(for: $0) } ?? [] }
     var project: StudioProject? { projects.first { $0.id == projectID } }
-    var threads: [Conversation] { roleID.flatMap { conversations[$0] } ?? [] }
+    var threads: [Conversation] { roleID.map { activeThreads(for: $0) } ?? [] }
+    var pinnedThreads: [Conversation] {
+        threads.filter { $0.pinnedAt != nil }
+            .sorted { ($0.pinnedAt ?? .distantPast) > ($1.pinnedAt ?? .distantPast) }
+    }
+    var archivedThreads: [Conversation] {
+        conversations.values.flatMap { $0 }.filter { $0.archivedAt != nil }
+            .sorted { ($0.archivedAt ?? .distantPast) > ($1.archivedAt ?? .distantPast) }
+    }
     var conversation: Conversation? { threads.first { $0.id == conversationID } }
     var isGeneratingHere: Bool { runningConversation != nil && runningConversation == conversationID }
-    var queuedTurns: [QueuedTurn] { conversationID.flatMap { queuedByConversation[$0] } ?? [] }
     var activePermission: ToolPermission? { isGeneratingHere ? permissions.first : nil }
-    var canEditQueuedTurn: Bool { draft.isEmpty && images.isEmpty && selectedSkill == nil && pendingImages == 0 }
     var canSend: Bool {
-        !loadingRunSettings && pendingImages == 0 && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty)
+        !loadingRunSettings && insertingMessage == nil && pendingImages == 0
+            && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !images.isEmpty)
     }
     var runSettingsContext: UUID { draftContext }
     var runSettings: HermesRunSettings? { composerSessionID.flatMap { runSettingsBySession[$0] } }
@@ -111,7 +125,42 @@ final class StudioModel: ObservableObject {
         return skills.filter { allowed.contains($0.id) }
     }
     var recentThreads: [Conversation] {
-        conversations.values.flatMap { $0 }.sorted { $0.updated > $1.updated }
+        conversations.values.flatMap { $0 }.filter { $0.archivedAt == nil }.sorted { $0.updated > $1.updated }
+    }
+
+    func activeThreads(for roleID: UUID) -> [Conversation] {
+        conversations[roleID, default: []].filter { $0.archivedAt == nil }
+    }
+
+    func toggleConversationPin(_ thread: Conversation) {
+        guard thread.id != runningConversation else { return }
+        do {
+            let updated = try store.setConversationPinned(thread.pinnedAt == nil, id: thread.id, for: thread.roleID)
+            refreshConversationMetadata(updated)
+        } catch { report(error) }
+    }
+
+    func setConversationArchived(_ thread: Conversation, archived: Bool) {
+        guard thread.id != runningConversation else { return }
+        do {
+            let updated = try store.setConversationArchived(archived, id: thread.id, for: thread.roleID)
+            refreshConversationMetadata(updated)
+            if archived, selectedThreads[thread.roleID] == thread.id {
+                selectedThreads.removeValue(forKey: thread.roleID)
+            }
+            if archived, conversationID == thread.id {
+                conversationID = nil
+                draftContext = UUID()
+                prewarm()
+            }
+        } catch { report(error) }
+    }
+
+    private func refreshConversationMetadata(_ thread: Conversation) {
+        error = nil
+        if let index = conversations[thread.roleID]?.firstIndex(where: { $0.id == thread.id }) {
+            conversations[thread.roleID]?[index] = thread
+        }
     }
 
     func projects(for roleID: UUID) -> [StudioProject] { projectsByRole[roleID, default: []] }
@@ -142,14 +191,28 @@ final class StudioModel: ObservableObject {
         }
     }
 
+    var canRefreshRuntime: Bool { runningConversation == nil && !loadingRunSettings }
+
+    func checkForHermesUpdates() {
+        guard let backend, !checkingHermesUpdate else { return }
+        let revision = runtimeRevision
+        checkingHermesUpdate = true
+        Task {
+            let result = await backend.checkForUpdates()
+            checkingHermesUpdate = false
+            if runtimeRevision == revision { hermesUpdate = result }
+        }
+    }
+
     func refreshRuntime() {
-        guard runningConversation == nil, !loadingRunSettings else { return }
+        guard canRefreshRuntime else { return }
         let revision = UUID()
         runtimeRevision = revision
         let runtime = HermesRuntime.discover()
         backend = runtime
         available = runtime != nil
         modelName = ""
+        hermesUpdate = nil
         guard let runtime else {
             skills = []
             terminalHome = nil
@@ -241,7 +304,7 @@ final class StudioModel: ObservableObject {
 
     @discardableResult
     func moveConversation(_ id: UUID, to project: StudioProject?) -> Bool {
-        guard let roleID, let index = threads.firstIndex(where: { $0.id == id }) else { return false }
+        guard let roleID, threads.contains(where: { $0.id == id }) else { return false }
         if let project, !projects.contains(project) { return false }
         guard id != runningConversation else {
             error = "这条对话正在回复，结束后可以移动。"
@@ -249,7 +312,7 @@ final class StudioModel: ObservableObject {
         }
         do {
             let moved = try store.moveConversation(id, for: roleID, to: project?.id)
-            conversations[roleID]?[index] = moved
+            refreshConversationMetadata(moved)
             if conversationID == id { projectID = moved.projectID }
             return true
         } catch {
@@ -424,6 +487,11 @@ final class StudioModel: ObservableObject {
         archivedRoles.removeAll { $0.id == id }
     }
 
+    func deleteArchivedRole(_ id: UUID) throws {
+        try store.trashArchivedRole(id)
+        archivedRoles.removeAll { $0.id == id }
+    }
+
     func refreshArchive() {
         do {
             try store.purgeExpiredRoles()
@@ -464,54 +532,20 @@ final class StudioModel: ObservableObject {
                 error = "另一条对话正在回复，等它结束后再发。"
                 return
             }
-            guard let conversationID else { return }
-            queuedByConversation[conversationID, default: []].append(QueuedTurn(text: text, images: images, skill: selectedSkill))
-            draft = ""
-            self.images = []
-            selectedSkill = nil
-            submitNextFollowUp()
+            guard images.isEmpty, selectedSkill == nil, !text.hasPrefix("/") else {
+                error = "执行中仅可插入普通文字。图片、技能或命令已留在输入框。"
+                return
+            }
+            let id = UUID()
+            guard turnControl?.insert(id: id, text: text) == true else {
+                error = "Hermes 还未准备好接收补充，消息仍在输入框。"
+                return
+            }
+            insertingMessage = id
+            error = nil
             return
         }
-        deliver(text: text, images: images, skill: selectedSkill, base: nil, activate: true)
-    }
-
-    func cancelQueuedTurn(_ id: UUID) {
-        guard id != submittedFollowUp, let conversationID else { return }
-        removeQueuedTurn(id, from: conversationID)
-        submitNextFollowUp()
-    }
-
-    func editQueuedTurn(_ queued: QueuedTurn) {
-        guard canEditQueuedTurn, queued.id != submittedFollowUp else { return }
-        cancelQueuedTurn(queued.id)
-        draft = queued.text
-        images = queued.images
-        selectedSkill = queued.skill
-    }
-
-    func prioritizeQueuedTurn(_ queued: QueuedTurn) {
-        guard let conversationID, var queue = queuedByConversation[conversationID],
-            let index = queue.firstIndex(where: { $0.id == queued.id }) else { return }
-        let firstPending = queue.first?.id == submittedFollowUp ? 1 : 0
-        guard index > firstPending else { return }
-        queue.insert(queue.remove(at: index), at: firstPending)
-        queuedByConversation[conversationID] = queue
-        submitNextFollowUp()
-    }
-
-    private func submitNextFollowUp() {
-        guard submittedFollowUp == nil, let runningConversation,
-            let queued = queuedByConversation[runningConversation]?.first,
-            queued.id != rejectedFollowUp, queued.supportsNativeQueue,
-            turnControl?.enqueueFollowUp(id: queued.id, text: queued.text) == true else { return }
-        submittedFollowUp = queued.id
-    }
-
-    func sendQueuedTurn(_ queued: QueuedTurn) {
-        guard runningConversation == nil, let conversation else { return }
-        if deliver(text: queued.text, images: queued.images, skill: queued.skill, base: conversation, activate: false) {
-            removeQueuedTurn(queued.id, from: conversation.id)
-        }
+        deliver(text: text, images: images, skill: selectedSkill)
     }
 
     func respond(to permission: ToolPermission, option: String?) {
@@ -520,37 +554,23 @@ final class StudioModel: ObservableObject {
             error = "这条审核请求已失效。"
         }
         permissions.removeAll { $0.id == permission.id }
-        submitNextFollowUp()
-    }
-
-    private func removeQueuedTurn(_ id: UUID, from conversationID: UUID) {
-        queuedByConversation[conversationID]?.removeAll { $0.id == id }
-        if queuedByConversation[conversationID]?.isEmpty == true { queuedByConversation[conversationID] = nil }
     }
 
     @discardableResult
-    private func deliver(text: String, images attachments: [ImagePayload], skill selectedSkill: HermesSkill?,
-        base: Conversation?, activate: Bool) -> Bool {
-        guard let targetRoleID = base?.roleID ?? roleID, let backend else { return false }
-        let workspace: URL?
-        if let base {
-            workspace = projects(for: targetRoleID).first(where: { $0.id == base.projectID })?.directory
-        } else {
-            workspace = project?.directory
-            if projectID != nil, workspace == nil {
-                error = "找不到此助手的项目。可以先将对话移回对话记录。"
-                return false
-            }
+    private func deliver(text: String, images attachments: [ImagePayload], skill selectedSkill: HermesSkill?) -> Bool {
+        guard let targetRoleID = roleID, let backend else { return false }
+        let workspace = project?.directory
+        if projectID != nil, workspace == nil {
+            error = "找不到此助手的项目。可以先将对话移回对话记录。"
+            return false
         }
         if let workspace, (try? workspace.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) != true {
             error = "项目目录已移动或不可访问。"
             return false
         }
-        var thread = base ?? conversation ?? Conversation(roleID: targetRoleID)
-        if base == nil {
-            thread.projectID = projectID
-            thread.sessionID = composerSessionID
-        }
+        var thread = conversation ?? Conversation(roleID: targetRoleID)
+        thread.projectID = projectID
+        thread.sessionID = composerSessionID
         if thread.messages.isEmpty {
             thread.title = String(text.split(whereSeparator: \.isNewline).first?.prefix(32) ?? "图片消息")
         }
@@ -568,17 +588,15 @@ final class StudioModel: ObservableObject {
             report(error)
             return false
         }
-        var requestIndex = thread.messages.count - 1
-        var start = ContinuousClock.now
+        let requestIndex = thread.messages.count - 1
+        let start = ContinuousClock.now
         publish(thread)
         runningConversation = thread.id
-        if activate {
-            select(thread)
-            draft = ""
-            images = []
-            self.selectedSkill = nil
-            error = nil
-        }
+        select(thread)
+        draft = ""
+        images = []
+        self.selectedSkill = nil
+        error = nil
         activity = "正在提交消息"
         let control = TurnControl()
         turnControl = control
@@ -623,27 +641,27 @@ final class StudioModel: ObservableObject {
                     permissions.append(permission)
                 case .permissionExpired(let toolID):
                     permissions.removeAll { $0.toolID == toolID }
-                    submitNextFollowUp()
-                case .followUpReady:
-                    submitNextFollowUp()
-                case .followUpStarted(let id):
-                    guard let queued = queuedByConversation[thread.id]?.first(where: { $0.id == id }) else { continue }
-                    finishRequest(in: &thread, at: requestIndex, started: start)
-                    var message = Message(.user, queued.text)
+                case .followUpReady, .followUpStarted, .followUpRejected:
+                    break
+                case .insertionAccepted(let id, let text):
+                    guard id == insertingMessage else { continue }
+                    var message = Message(.user, text)
                     message.id = id
+                    message.isGuidance = true
                     thread.messages.append(message)
-                    thread.updated = Date()
-                    requestIndex = thread.messages.count - 1
-                    start = .now
-                    submittedFollowUp = nil
-                    removeQueuedTurn(id, from: thread.id)
-                    activity = "等待追问回复"
+                    if self.roleID == targetRoleID, draft.trimmingCharacters(in: .whitespacesAndNewlines) == text {
+                        draft = ""
+                    }
+                    if drafts[targetRoleID]?.trimmingCharacters(in: .whitespacesAndNewlines) == text {
+                        drafts[targetRoleID] = nil
+                    }
+                    insertingMessage = nil
                     publish(thread)
                     persist(thread)
-                case .followUpRejected(let id):
-                    guard submittedFollowUp == id else { continue }
-                    submittedFollowUp = nil
-                    rejectedFollowUp = id
+                case .insertionFailed(let id, let reason):
+                    guard id == insertingMessage else { continue }
+                    insertingMessage = nil
+                    if self.conversationID == thread.id { error = reason }
                 case .activity(let title):
                     activity = title
                 case .finished(let reason):
@@ -661,16 +679,14 @@ final class StudioModel: ObservableObject {
             persist(thread)
             runningConversation = nil
             turnControl = nil
-            submittedFollowUp = nil
-            rejectedFollowUp = nil
+            if insertingMessage != nil, self.conversationID == thread.id {
+                error = "当前回合已结束，未收到插入确认，消息仍在输入框。"
+            }
+            insertingMessage = nil
             permissions.removeAll()
             activity = ""
             if self.roleID == targetRoleID {
                 do { try reloadFiles(for: targetRoleID) } catch { report(error) }
-            }
-            if let queued = queuedByConversation[thread.id]?.first,
-                deliver(text: queued.text, images: queued.images, skill: queued.skill, base: thread, activate: false) {
-                removeQueuedTurn(queued.id, from: thread.id)
             }
         }
         return true

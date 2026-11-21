@@ -228,6 +228,67 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertFalse(original.contains("Queued for the next turn"), original)
     }
 
+    func testLiveHermesInsertsIntoActiveTurnAndRefusesAfterItEnds() async throws {
+        guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
+            throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证执行中插入。")
+        }
+        let runtime = try XCTUnwrap(HermesRuntime.discover())
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = RoleStore(root: root)
+        let role = Role(name: "插入验证", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let home = store.runtime(for: role.id)
+        defer {
+            runtime.reset(home: home)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let project = try store.createProject(name: "插入验证", directory: nil, for: role.id)
+        let control = TurnControl()
+        let timeout = Task {
+            do { try await Task.sleep(for: .seconds(80)) } catch { return }
+            control.cancel()
+        }
+        defer { timeout.cancel() }
+        let id = UUID()
+        let insertion = "补充原任务，不需要重跑命令。最终答复请保留原始标记，并附上 INSERT-SAME-TURN-OK。"
+        var sessionID: String?
+        var sent = false
+        var accepted = false
+        var ended = false
+        var answer = ""
+        for await event in runtime.turn(home: home, conversation: Conversation(roleID: role.id),
+            text: "请只调用一次 terminal 执行 `sleep 10 && printf ready`，完成后答复必须包含原始标记 ORIGINAL-WORK。",
+            workspace: project.directory, interactive: true, control: control) {
+            switch event {
+            case .session(let value): sessionID = value
+            case .tool(let tool) where tool.category == "execute" && tool.isRunning && !sent:
+                sent = control.insert(id: id, text: insertion)
+            case .insertionAccepted(let receivedID, let text):
+                XCTAssertFalse(ended)
+                XCTAssertEqual(receivedID, id)
+                XCTAssertEqual(text, insertion)
+                accepted = true
+            case .insertionFailed(_, let error): XCTFail(error)
+            case .text(let text, _): answer += text
+            case .permission(let request): _ = control.respond(to: request.id, optionID: nil)
+            case .finished(let status):
+                XCTAssertEqual(status, "end_turn")
+                ended = true
+            case .failed(let error): throw StudioError.message(error)
+            default: break
+            }
+        }
+        XCTAssertTrue(sent && accepted && ended)
+        XCTAssertTrue(answer.contains("ORIGINAL-WORK"), answer)
+        XCTAssertTrue(answer.contains("INSERT-SAME-TURN-OK"), answer)
+        do {
+            try await runtime.insertIntoRunningTurn("过期的补充", sessionID: XCTUnwrap(sessionID), home: home)
+            XCTFail("回合结束后，插入请求不应进入新一轮。")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("回合已经结束"), error.localizedDescription)
+        }
+    }
+
     func testLiveHermesDeniesFileEditBeforeWriting() async throws {
         guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
             throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证真实文件审核。")

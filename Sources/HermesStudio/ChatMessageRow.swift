@@ -52,7 +52,7 @@ struct ChatMessageRow: View {
                     .accessibilityHidden(true)
             }
             if !isUser || message.isGuidance == true {
-                Text(isUser ? "追问" : role?.name ?? "Hermes")
+                Text(isUser ? "执行中补充" : role?.name ?? "Hermes")
                     .fontWeight(.semibold)
                     .foregroundStyle(isUser ? StudioPalette.muted : StudioPalette.ink)
             }

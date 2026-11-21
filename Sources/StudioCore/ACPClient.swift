@@ -12,6 +12,8 @@ public enum TurnEvent: Sendable {
     case followUpReady
     case followUpStarted(UUID)
     case followUpRejected(UUID)
+    case insertionAccepted(UUID, String)
+    case insertionFailed(UUID, String)
     case activity(String)
     case finished(String)
     case failed(String)
@@ -24,6 +26,7 @@ public final class TurnControl: @unchecked Sendable {
     private var submitFollowUp: ((UUID, String) throws -> Void)?
     private var acceptsFollowUps = false
     private var followUp: (id: UUID, text: String, started: Bool, acknowledged: Bool)?
+    private var sendInsertion: ((UUID, String) -> Void)?
     private var permissions: [UUID: (ToolPermission, (String?) throws -> Void)] = [:]
 
     public init() {}
@@ -48,6 +51,18 @@ public final class TurnControl: @unchecked Sendable {
                 return false
             }
         }
+    }
+
+    public func insert(id: UUID, text: String) -> Bool {
+        lock.withLock {
+            guard !cancelled, permissions.isEmpty, let sendInsertion else { return false }
+            sendInsertion(id, text)
+            return true
+        }
+    }
+
+    fileprivate func handleInsertion(_ handler: @escaping (UUID, String) -> Void) {
+        lock.withLock { sendInsertion = handler }
     }
 
     public func respond(to id: UUID, optionID: String?) -> Bool {
@@ -124,6 +139,7 @@ public final class TurnControl: @unchecked Sendable {
             submitFollowUp = nil
             acceptsFollowUps = false
             followUp = nil
+            sendInsertion = nil
             permissions.removeAll()
         }
     }
@@ -230,6 +246,18 @@ extension HermesRuntime {
         let sessionID = try worker.session(existing: conversation.sessionID, workspace: workspace)
         if conversation.sessionID == nil { receive(.session(sessionID)) }
         if interactive, let settings = worker.rpc.settings[sessionID] { receive(.runSettings(settings)) }
+        if interactive {
+            control.handleInsertion { id, text in
+                Task {
+                    do {
+                        try await insertIntoRunningTurn(text, sessionID: sessionID, home: home)
+                        receive(.insertionAccepted(id, text))
+                    } catch {
+                        receive(.insertionFailed(id, error.localizedDescription))
+                    }
+                }
+            }
+        }
         var prompt: [[String: Any]] = []
         if let skill, skillIDs?.contains(skill.id) != false {
             prompt.append(["type": "text", "text": "当前任务选择了 Hermes 技能「\(skill.name)」。请在回答前调用 skill_view，使用相对路径 \(skill.id) 获取技能指令。"])

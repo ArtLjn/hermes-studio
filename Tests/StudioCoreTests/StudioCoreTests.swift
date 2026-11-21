@@ -7,6 +7,87 @@ import XCTest
 @testable import StudioCore
 
 final class StudioCoreTests: XCTestCase {
+    func testMovingDataRootKeepsRolesMemoryAndProjectFolders() throws {
+        let files = FileManager.default
+        let parent = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: parent) }
+        let legacy = RoleStore(root: parent.appendingPathComponent("旧数据"))
+        let destination = RoleStore(root: parent.appendingPathComponent("hermesgroup"))
+        let role = Role(name: "迁移验证", summary: "", template: .blank)
+        try legacy.create(role, instructions: "原有角色指令")
+        try legacy.writeFile(.memory, for: role.id, text: "原有角色记忆")
+        let internalProject = try legacy.createProject(name: "内置项目", directory: nil, for: role.id)
+        let external = parent.appendingPathComponent("外部目录")
+        try files.createDirectory(at: external, withIntermediateDirectories: true)
+        let externalProject = try legacy.createProject(name: "外部项目", directory: external, for: role.id)
+        var thread = Conversation(roleID: role.id)
+        thread.projectID = internalProject.id
+        thread.messages = [Message(.user, "原有消息")]
+        try legacy.save(thread)
+
+        try destination.migrateDataIfNeeded(from: legacy.root)
+        XCTAssertEqual(try destination.list(), [role])
+        XCTAssertEqual(try destination.conversations(for: role.id), [thread])
+        XCTAssertEqual(try destination.file(.memory, for: role.id), "原有角色记忆")
+        let projects = try destination.projects(for: role.id)
+        let relocated = try XCTUnwrap(projects.first { $0.id == internalProject.id })
+        XCTAssertTrue(relocated.path.hasPrefix(destination.root.resolvingSymlinksInPath().path + "/"))
+        XCTAssertTrue(files.fileExists(atPath: relocated.path))
+        XCTAssertEqual(projects.first { $0.id == externalProject.id }, externalProject)
+        try destination.writeFile(.memory, for: role.id, text: "升级后的修改")
+        try destination.migrateDataIfNeeded(from: legacy.root)
+        XCTAssertEqual(try destination.file(.memory, for: role.id), "升级后的修改")
+        XCTAssertEqual(try legacy.file(.memory, for: role.id), "原有角色记忆")
+    }
+
+    func testConversationPinArchiveAndRestorePreserveHistoryAndProject() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "整理对话", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let project = try store.createProject(name: "归档验证", directory: nil, for: role.id)
+        var thread = Conversation(roleID: role.id)
+        thread.projectID = project.id
+        thread.sessionID = "测试会话"
+        thread.messages = [Message(.user, "历史问题"), Message(.assistant, "历史答复")]
+        try store.save(thread)
+
+        let pinned = try store.setConversationPinned(true, id: thread.id, for: role.id)
+        XCTAssertNotNil(pinned.pinnedAt)
+        let archived = try store.setConversationArchived(true, id: thread.id, for: role.id)
+        XCTAssertNotNil(archived.archivedAt)
+        let reopened = RoleStore(root: root)
+        XCTAssertEqual(try reopened.conversations(for: role.id), [archived])
+        XCTAssertThrowsError(try reopened.setConversationPinned(false, id: thread.id, for: role.id))
+        XCTAssertEqual(try reopened.setConversationArchived(false, id: thread.id, for: role.id), pinned)
+        XCTAssertEqual(try reopened.setConversationPinned(false, id: thread.id, for: role.id), thread)
+    }
+
+    func testDeletingDraftRoleMovesItsDataToTrashAndKeepsLinkedFolder() throws {
+        let files = FileManager.default
+        let root = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "草稿箱删除验证", summary: "", template: .blank)
+        try store.create(role, instructions: "角色指令")
+        let linked = root.appendingPathComponent("外部项目")
+        try files.createDirectory(at: linked, withIntermediateDirectories: true)
+        _ = try store.createProject(name: "外部项目", directory: linked, for: role.id)
+        let owned = try store.createProject(name: "角色内项目", directory: nil, for: role.id)
+        try store.save(Conversation(roleID: role.id))
+        XCTAssertThrowsError(try store.trashArchivedRole(role.id))
+        _ = try store.archive(role.id)
+        let trash = try XCTUnwrap(store.trashArchivedRole(role.id))
+        defer { try? files.removeItem(at: trash) }
+
+        XCTAssertTrue(try store.archivedRoles().isEmpty)
+        XCTAssertTrue(files.fileExists(atPath: linked.path))
+        XCTAssertFalse(files.fileExists(atPath: owned.path))
+        XCTAssertTrue(files.fileExists(atPath: trash.appendingPathComponent("conversations.json").path))
+        XCTAssertTrue(files.fileExists(atPath: trash.appendingPathComponent("Projects/角色内项目").path))
+    }
+
     func testRoleFilesAndConversationsAreIsolatedAfterReopening() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -338,7 +419,8 @@ final class StudioCoreTests: XCTestCase {
                 let updated = tools[tool.id]?.updating(with: tool) ?? tool
                 tools[tool.id] = updated
                 onTool(updated)
-            case .activity, .image, .permission, .permissionExpired, .followUpReady, .followUpStarted, .followUpRejected, .runSettings: break
+            case .activity, .image, .permission, .permissionExpired, .followUpReady, .followUpStarted, .followUpRejected,
+                .runSettings, .insertionAccepted, .insertionFailed: break
             }
         }
         return (sessionID, reply)

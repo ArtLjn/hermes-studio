@@ -90,7 +90,15 @@ struct ChatComposer: View {
                     select($0, for: token)
                 }
             }
-            if !studio.queuedTurns.isEmpty { queuedMessages }
+            if studio.isGeneratingHere, studio.insertingMessage != nil {
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.mini)
+                    Text("正在插入当前任务")
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(StudioPalette.muted)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
             composer(suggestion: suggestion)
         }
         .onChange(of: token) { _, _ in
@@ -220,75 +228,6 @@ struct ChatComposer: View {
         focused = true
     }
 
-    private var queuedMessages: some View {
-        let queue = studio.queuedTurns
-        return ScrollView {
-            VStack(spacing: 2) {
-                ForEach(queue) { queuedTray($0) }
-            }
-        }
-        .frame(height: CGFloat(min(queue.count, 3)) * 34)
-        .padding(.horizontal, 5)
-        .background(StudioPalette.raised, in: RoundedRectangle(cornerRadius: 11))
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("待发消息")
-    }
-
-    private func queuedTray(_ queued: QueuedTurn) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: "arrow.turn.down.right")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(StudioPalette.accent)
-                .accessibilityHidden(true)
-            if let first = queued.images.first, let thumbnail = NSImage(data: first.data) {
-                Image(nsImage: thumbnail).resizable().scaledToFill()
-                    .frame(width: 22, height: 22)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .accessibilityHidden(true)
-            }
-            if queued.text.isEmpty {
-                Text("\(queued.images.count) 张图片").lineLimit(1)
-            } else {
-                Text(queued.text).lineLimit(1).help(queued.text)
-                if !queued.images.isEmpty { Text("\(queued.images.count) 张图片") }
-            }
-            if let skill = queued.skill { Label(skill.name, systemImage: "puzzlepiece").lineLimit(1) }
-            Spacer(minLength: 4)
-            if queued.id == studio.submittedFollowUp {
-                Text("已提交给 Hermes").font(.system(size: 11))
-            } else if studio.runningConversation == nil {
-                Button("发送") { studio.sendQueuedTurn(queued) }
-                    .buttonStyle(.plain)
-            }
-            if queued.id != studio.submittedFollowUp {
-                Button("移除待发消息", systemImage: "trash") { studio.cancelQueuedTurn(queued.id) }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(.plain)
-                    .help("移除待发消息")
-                Menu {
-                    if queued.id != studio.queuedTurns.first(where: { $0.id != studio.submittedFollowUp })?.id {
-                        Button("下一条发送", systemImage: "arrow.up.to.line") { studio.prioritizeQueuedTurn(queued) }
-                    }
-                    Button("取回编辑", systemImage: "pencil") {
-                        studio.editQueuedTurn(queued)
-                        focused = true
-                    }
-                    .disabled(!studio.canEditQueuedTurn)
-                } label: {
-                    Image(systemName: "ellipsis").frame(width: 18, height: 24)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .accessibilityLabel("更多待发消息操作")
-            }
-        }
-        .font(.system(size: 11, weight: .medium))
-        .foregroundStyle(StudioPalette.muted)
-        .padding(.horizontal, 10)
-        .frame(height: 32)
-    }
-
     private var contextTray: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 7) {
@@ -371,9 +310,9 @@ struct ChatComposer: View {
             ComposerRunSettingsButton(studio: studio)
             if studio.isGeneratingHere {
                 actionButton("停止回复", symbol: "stop.fill", action: studio.stop)
-                actionButton("追加请求", symbol: "arrow.up", action: studio.send)
+                actionButton("插入当前任务", symbol: "arrow.up", action: studio.send)
                     .disabled(!studio.canSend)
-                    .help("在当前回复结束后自动发送")
+                    .help("把文字加入正在执行的任务")
             } else {
                 actionButton("发送消息", symbol: "arrow.up", action: studio.send)
                     .keyboardShortcut(.return, modifiers: .command)

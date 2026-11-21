@@ -1,18 +1,32 @@
 import StudioCore
 import SwiftUI
 
-enum ManagementPage: String, CaseIterable {
+enum ManagementPage: String {
     case overview = "工作台"
     case roles = "角色库"
     case projects = "项目"
     case conversations = "对话记录"
+    case archivedChats = "已归档对话"
+    case drafts = "角色草稿箱"
+
+    static let destinations: [Self] = [.overview, .roles, .projects, .conversations]
+
+    var navigationRoot: Self {
+        switch self {
+        case .archivedChats: .conversations
+        case .drafts: .roles
+        default: self
+        }
+    }
 
     var icon: String {
         switch self {
-        case .overview: "square.grid.2x2"
+        case .overview: "house"
         case .roles: "person.2"
         case .projects: "folder"
-        case .conversations: "bubble.left.and.bubble.right"
+        case .conversations: "clock"
+        case .archivedChats: "archivebox"
+        case .drafts: "tray"
         }
     }
 }
@@ -20,20 +34,17 @@ enum ManagementPage: String, CaseIterable {
 struct ManagementPane: View {
     @ObservedObject var studio: StudioModel
     @Binding var page: ManagementPage
-    let sidebarVisible: Bool
     let toolbarLeading: CGFloat
-    let sidebarLabel: String
-    let toggleSidebar: () -> Void
     let create: () -> Void
     let edit: (Role) -> Void
     let details: (Role) -> Void
     let terminalDetails: (URL) -> Void
     let editFile: (Role, RoleFile) -> Void
     let createProject: (Role) -> Void
-    let openDraftBox: () -> Void
     @State private var roleQuery = ""
     @State private var conversationQuery = ""
     @State private var pinnedOnly = false
+    @State private var previewingArchive: UUID?
     @FocusState private var searchFocused: Bool
 
     private var orderedRoles: [Role] {
@@ -62,6 +73,64 @@ struct ManagementPane: View {
         return studio.recentThreads.filter { $0.title.localizedCaseInsensitiveContains(query) || matchingIDs.contains($0.roleID) }
     }
 
+    private var archivedPage: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            pageTitle("已归档对话", subtitle: "恢复后，对话会回到原来的角色和项目。", addRole: false)
+            if studio.archivedThreads.isEmpty {
+                emptyState("还没有已归档的对话", icon: "archivebox")
+            } else {
+                LazyVStack(spacing: 0) {
+                    ForEach(studio.archivedThreads) { thread in
+                        if let role = role(for: thread), let archivedAt = thread.archivedAt {
+                            HStack(spacing: 10) {
+                                RolePortrait(role: role, store: studio.store, size: 32)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(thread.title).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                                    let project = studio.projects(for: role.id).first { $0.id == thread.projectID }
+                                    Text([role.name, project?.name].compactMap { $0 }.joined(separator: " · "))
+                                        .font(.system(size: 11)).foregroundStyle(StudioPalette.muted)
+                                        .lineLimit(1)
+                                }
+                                Spacer()
+                                Text(archivedAt, style: .date)
+                                    .font(.system(size: 11)).foregroundStyle(StudioPalette.muted)
+                                Button("恢复", systemImage: "arrow.uturn.backward") {
+                                    studio.setConversationArchived(thread, archived: false)
+                                    if previewingArchive == thread.id { previewingArchive = nil }
+                                }
+                                .buttonStyle(QuietButton())
+                                .accessibilityLabel("恢复对话 \(thread.title)")
+                                Button(previewingArchive == thread.id ? "收起" : "查看",
+                                    systemImage: previewingArchive == thread.id ? "chevron.up" : "chevron.down") {
+                                    previewingArchive = previewingArchive == thread.id ? nil : thread.id
+                                }
+                                .buttonStyle(QuietButton())
+                            }
+                            .padding(.vertical, 9)
+                            if previewingArchive == thread.id {
+                                VStack(alignment: .leading, spacing: 18) {
+                                    if thread.messages.isEmpty {
+                                        Text("这条对话还没有消息。")
+                                            .font(.system(size: 12)).foregroundStyle(StudioPalette.muted)
+                                    }
+                                    ForEach(ChatTurn.collect(thread.messages)) { turn in
+                                        ChatTurnRow(turn: turn, role: role, store: studio.store,
+                                            roleID: role.id, activity: nil)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .background(StudioPalette.sidebar, in: RoundedRectangle(cornerRadius: 9))
+                                .padding(.bottom, 9)
+                            }
+                            StudioRule()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             topBar
@@ -76,6 +145,8 @@ struct ManagementPane: View {
                     case .roles: catalog
                     case .projects: ProjectPane(studio: studio, create: createProject)
                     case .conversations: conversationList
+                    case .archivedChats: archivedPage
+                    case .drafts: RoleDraftBox(studio: studio)
                     }
                     if let error = studio.error {
                         Label(error, systemImage: "info.circle")
@@ -99,37 +170,24 @@ struct ManagementPane: View {
 
     private var topBar: some View {
         HStack(spacing: 9) {
-            StudioIconButton(title: sidebarLabel, symbol: "sidebar.left", action: toggleSidebar)
-            if !sidebarVisible {
-                Menu {
-                    ForEach(ManagementPage.allCases, id: \.self) { tab in
-                        Button(tab.rawValue, systemImage: tab == page ? "checkmark" : tab.icon) { navigate(tab) }
-                    }
+            if page != page.navigationRoot {
+                Button {
+                    navigate(page.navigationRoot)
                 } label: {
-                    Label(page.rawValue, systemImage: page.icon)
-                        .font(.system(size: 12, weight: .semibold))
+                    Label(page.navigationRoot.rawValue, systemImage: "chevron.left")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(StudioPalette.muted)
+                        .padding(.horizontal, 6)
+                        .frame(height: 28)
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .accessibilityLabel("切换页面")
+                .buttonStyle(StudioRowButton())
+                .accessibilityLabel("返回\(page.navigationRoot.rawValue)")
             }
             Spacer()
-            Button {
-                if page != .conversations { navigate(.roles) }
-                searchFocused = true
-            } label: {
-                Label(page == .conversations ? "搜索对话" : "搜索角色", systemImage: "magnifyingglass")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(StudioPalette.muted)
-                    .padding(.horizontal, 7)
-                    .frame(height: 28)
-            }
-            .buttonStyle(StudioRowButton())
-            .keyboardShortcut("k", modifiers: .command)
-            .help("搜索（⌘K）")
-            if !sidebarVisible {
-                StudioIconButton(title: studio.available ? "重新检测本机 Hermes" : "未检测到 Hermes，点击重新检测",
-                    symbol: studio.available ? "checkmark.circle" : "exclamationmark.circle", action: studio.refreshRuntime)
+            if page == .roles || page == .conversations {
+                StudioIconButton(title: page == .conversations ? "搜索对话（⌘K）" : "搜索角色（⌘K）",
+                    symbol: "magnifyingglass") { searchFocused = true }
+                    .keyboardShortcut("k", modifiers: .command)
             }
         }
         .padding(.leading, toolbarLeading)
@@ -175,6 +233,9 @@ struct ManagementPane: View {
                 sectionTitle("全部对话", count: matchingThreads.count)
                 Spacer()
                 searchBox("搜索对话或角色", query: $conversationQuery)
+                Button("已归档", systemImage: "archivebox") { navigate(.archivedChats) }
+                    .buttonStyle(QuietButton())
+                    .fixedSize()
             }
             if matchingThreads.isEmpty {
                 emptyState(conversationQuery.isEmpty ? "还没有对话记录" : "没有匹配的对话", icon: "bubble.left.and.bubble.right")
@@ -217,7 +278,7 @@ struct ManagementPane: View {
                     editInstructions: { studio.withTerminalRole(from: terminalHome) { editFile($0, .soul) } })
             }
             ForEach(roles) { role in
-                ManagementRoleCard(role: role, store: studio.store, conversationCount: studio.conversations[role.id]?.count ?? 0,
+                ManagementRoleCard(role: role, store: studio.store, conversationCount: studio.activeThreads(for: role.id).count,
                     open: { studio.select(role) }, details: { details(role) }, togglePin: { studio.togglePin(role) },
                     edit: { edit(role) }, editFile: { editFile(role, $0) }, archive: { studio.archiveRole(role) })
             }
@@ -225,7 +286,7 @@ struct ManagementPane: View {
     }
 
     private var draftBoxButton: some View {
-        Button(action: openDraftBox) {
+        Button { navigate(.drafts) } label: {
             Label(studio.archivedRoles.isEmpty ? "草稿箱" : "草稿箱（\(studio.archivedRoles.count)）", systemImage: "tray")
         }
         .buttonStyle(QuietButton())
@@ -319,5 +380,23 @@ struct WorkspaceConversationRow: View {
             .frame(height: 52)
         }
         .buttonStyle(StudioRowButton())
+        .contextMenu {
+            if thread.id != studio.runningConversation { ConversationOrganizationActions(studio: studio, thread: thread) }
+        }
+    }
+}
+
+struct ConversationOrganizationActions: View {
+    @ObservedObject var studio: StudioModel
+    let thread: Conversation
+
+    var body: some View {
+        Button(thread.pinnedAt == nil ? "置顶对话" : "取消置顶",
+            systemImage: thread.pinnedAt == nil ? "pin" : "pin.slash") {
+            studio.toggleConversationPin(thread)
+        }
+        Button("归档对话", systemImage: "archivebox") {
+            studio.setConversationArchived(thread, archived: true)
+        }
     }
 }

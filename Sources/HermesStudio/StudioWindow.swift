@@ -10,29 +10,27 @@ struct StudioWindow: View {
     @State private var managementPage = ManagementPage.overview
 
     private var panelAnimation: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.20) }
-    private var sidebarAction: () -> Void { { showSidebar.toggle() } }
-    private var sidebarLabel: String { showSidebar ? "收起侧栏" : "展开侧栏" }
-    private var toolbarLeading: CGFloat { showSidebar ? 14 : 78 }
+    private var showsConversationSidebar: Bool { !studio.showManagement && showSidebar }
+    private var toolbarLeading: CGFloat { showsConversationSidebar ? 14 : 78 - StudioPalette.sidebarRailWidth }
 
     var body: some View {
         GeometryReader { layout in
-            let showInlineInspector = layout.size.width >= (showSidebar ? 1070 : 910)
+            let showInlineInspector = layout.size.width >=
+                (showsConversationSidebar ? 1070 : 910) + StudioPalette.sidebarRailWidth
             HStack(spacing: 0) {
-                sidePanel(width: StudioPalette.sidebarWidth, edge: .leading, isOpen: showSidebar) {
-                    WorkspaceSidebar(studio: studio) {
-                        if studio.showManagement {
-                            managementNavigation
-                        } else {
-                            ChatSidebar(studio: studio, goHome: studio.goHome, createProject: { sheet = .project($0) })
-                        }
+                sidePanel(width: StudioPalette.sidebarRailWidth, edge: .leading, isOpen: true) {
+                    sidebarRail
+                }
+                if !studio.showManagement {
+                    sidePanel(width: StudioPalette.sidebarWidth, edge: .leading, isOpen: showSidebar) {
+                        ChatSidebar(studio: studio, createProject: { sheet = .project($0) })
                     }
                 }
                 if studio.showManagement {
-                    ManagementPane(studio: studio, page: $managementPage, sidebarVisible: showSidebar, toolbarLeading: toolbarLeading,
-                        sidebarLabel: sidebarLabel, toggleSidebar: sidebarAction,
+                    ManagementPane(studio: studio, page: $managementPage, toolbarLeading: toolbarLeading,
                         create: { sheet = .create }, edit: { sheet = .edit($0) }, details: { sheet = .details($0) },
                         terminalDetails: { sheet = .terminal($0) }, editFile: { sheet = .file($0, $1) },
-                        createProject: { sheet = .project($0) }, openDraftBox: { sheet = .draftBox })
+                        createProject: { sheet = .project($0) })
                 } else {
                     VStack(spacing: 0) {
                         header(showInlineInspector: showInlineInspector)
@@ -51,7 +49,7 @@ struct StudioWindow: View {
         .tint(StudioPalette.accent)
         .ignoresSafeArea()
         .onChange(of: studio.showManagement) { _, showing in
-            if showing { managementPage = .overview }
+            if !showing { managementPage = .overview }
         }
         .sheet(item: $sheet) { sheet in
             switch sheet {
@@ -70,8 +68,6 @@ struct StudioWindow: View {
                 RoleDetails(studio: studio, role: nil, home: home, edit: nil)
             case .project(let role):
                 ProjectEditor(studio: studio, role: role)
-            case .draftBox:
-                RoleDraftBox(studio: studio)
             }
         }
     }
@@ -91,25 +87,55 @@ struct StudioWindow: View {
             .animation(panelAnimation, value: isOpen)
     }
 
-    private var managementNavigation: some View {
-        VStack(spacing: 3) {
-            ForEach(ManagementPage.allCases, id: \.self) { page in
-                let selected = page == managementPage
-                Button { managementPage = page } label: {
-                    WorkspaceNavLabel(title: page.rawValue, symbol: page.icon, selected: selected)
+    private var sidebarRail: some View {
+        VStack(spacing: 5) {
+            if !studio.showManagement {
+                railButton(showSidebar ? "收起侧栏" : "展开侧栏", symbol: "sidebar.left") {
+                    showSidebar.toggle()
                 }
-                .buttonStyle(StudioRowButton(selected: selected))
-                .accessibilityAddTraits(selected ? .isSelected : [])
+                .padding(.bottom, 4)
             }
+            ForEach(ManagementPage.destinations, id: \.self) { page in
+                railButton(page.rawValue, symbol: page.icon,
+                    selected: (studio.showManagement ? managementPage.navigationRoot : .overview) == page) {
+                    openManagement(page)
+                }
+            }
+            if !studio.showManagement && !showSidebar {
+                StudioRule().padding(.horizontal, 12).padding(.vertical, 4)
+                railButton("新对话", symbol: "square.and.pencil", action: studio.newConversation)
+                if let role = studio.role { SidebarRoleMenu(studio: studio, role: role, compact: true) }
+            }
+            Spacer(minLength: 8)
+            HermesStatusButton(studio: studio)
+                .padding(.bottom, 6)
         }
-        .padding(.horizontal, 8)
+        .padding(.top, 37)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(StudioPalette.sidebar.opacity(0.68))
+    }
+
+    private func railButton(_ title: String, symbol: String, selected: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(selected ? StudioPalette.ink : StudioPalette.muted)
+                .frame(width: 36, height: 34)
+        }
+        .buttonStyle(StudioRowButton(selected: selected))
+        .accessibilityLabel(title)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .help(title)
+    }
+
+    private func openManagement(_ page: ManagementPage) {
+        managementPage = page
+        if !studio.showManagement { studio.goHome() }
     }
 
     private func header(showInlineInspector: Bool) -> some View {
         HStack(spacing: 9) {
-            StudioIconButton(title: sidebarLabel, symbol: "sidebar.left", action: sidebarAction)
             if !showSidebar {
-                StudioIconButton(title: "返回工作台", symbol: "arrow.left", action: studio.goHome)
                 if let role = studio.role {
                     Text(role.name).lineLimit(1).foregroundStyle(StudioPalette.muted)
                     breadcrumbSeparator
@@ -130,11 +156,6 @@ struct StudioWindow: View {
                 .lineLimit(1)
                 .layoutPriority(1)
             Spacer(minLength: 5)
-            Button(action: studio.newConversation) {
-                Label("新对话", systemImage: "square.and.pencil")
-            }
-            .buttonStyle(QuietButton())
-            .fixedSize()
             StudioIconButton(title: showInlineInspector ? (showInspector ? "收起角色与记忆" : "展开角色与记忆") : "角色与记忆",
                 symbol: "sidebar.right") {
                 if showInlineInspector {
@@ -166,13 +187,12 @@ struct StudioWindow: View {
 }
 
 enum StudioSheet: Identifiable {
-    case create, edit(Role), file(Role, RoleFile), inspect(Role), details(Role), terminal(URL), project(Role), draftBox
+    case create, edit(Role), file(Role, RoleFile), inspect(Role), details(Role), terminal(URL), project(Role)
 
     var id: String {
         switch self {
         case .create: "create"
         case .project(let role): "project-\(role.id)"
-        case .draftBox: "draft-box"
         case .edit(let role): "edit-\(role.id)"
         case .file(let role, let file): "file-\(role.id)-\(file)"
         case .inspect(let role): "inspect-\(role.id)"

@@ -90,7 +90,7 @@ struct ProjectPane: View {
     }
 
     private func project(_ project: StudioProject) -> some View {
-        let threads = studio.conversations[project.roleID, default: []].filter { $0.projectID == project.id }
+        let threads = studio.activeThreads(for: project.roleID).filter { $0.projectID == project.id }
         return VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Text(project.name).font(.system(size: 18, weight: .semibold)).lineLimit(1)

@@ -13,6 +13,7 @@ enum StudioPalette {
     static let connected = Color(red: 0.47, green: 0.78, blue: 0.66)
 
     static let sidebarWidth: CGFloat = 220
+    static let sidebarRailWidth: CGFloat = 52
     static let toolbarHeight: CGFloat = 56
     static let transcriptWidth: CGFloat = 740
 }

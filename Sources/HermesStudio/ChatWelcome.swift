@@ -20,7 +20,7 @@ struct ChatWelcome: View {
     }
 
     var body: some View {
-        let context = studio.available && role.terminalSource == nil ? Context(role: role, project: studio.project,
+        let context = studio.available && studio.roleID == role.id && role.terminalSource == nil ? Context(role: role, project: studio.project,
             memory: studio.roleFiles[.memory, default: ""], user: studio.roleFiles[.user, default: ""]) : nil
         let personalized = result.flatMap { $0.0 == context ? $0.1 : nil } ?? []
 

@@ -39,17 +39,21 @@ struct ChatPane: View {
                 .padding(.horizontal, 22)
                 .padding(.bottom, 8)
             }
-            ChatComposer(studio: studio, focused: $composerFocused, focusRequest: composerFocusRequest)
-                .frame(maxWidth: StudioPalette.transcriptWidth)
-                .padding(.horizontal, 22)
-                .padding(.bottom, 16)
+            VStack(spacing: 7) {
+                if let permission = studio.activePermission {
+                    ToolPermissionCard(permission: permission) { option in
+                        studio.respond(to: permission, option: option)
+                    }
+                    .id(permission.id)
+                }
+                ChatComposer(studio: studio, focused: $composerFocused, focusRequest: composerFocusRequest)
+            }
+            .frame(maxWidth: StudioPalette.transcriptWidth)
+            .padding(.horizontal, 22)
+            .padding(.bottom, 16)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onChange(of: studio.conversationID) { _, _ in composerFocused = true }
-        .sheet(item: Binding(get: { studio.activePermission }, set: { _ in })) { permission in
-            ToolPermissionSheet(permission: permission) { option in studio.respond(to: permission, option: option) }
-                .interactiveDismissDisabled()
-        }
     }
 
     private func transcript(_ thread: Conversation) -> some View {
@@ -77,6 +81,9 @@ struct ChatPane: View {
             }
             .onChange(of: studio.isGeneratingHere) { _, running in
                 if !running { proxy.scrollTo("chat-end", anchor: .bottom) }
+            }
+            .onChange(of: studio.activePermission?.id) { _, request in
+                if request != nil { proxy.scrollTo("chat-end", anchor: .bottom) }
             }
         }
     }

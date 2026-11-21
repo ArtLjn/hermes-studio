@@ -138,4 +138,20 @@ extension RoleStore {
     private func writeProjectCatalog(_ catalog: ProjectCatalog) throws {
         try JSONEncoder().encode(catalog).write(to: projectCatalogURL, options: .atomic)
     }
+
+    func relocateProjectPaths(from previousRoot: URL, to newRoot: URL) throws {
+        let previousPath = previousRoot.resolvingSymlinksInPath().path
+        var catalog = try readProjectCatalog()
+        var changed = false
+        for index in catalog.projects.indices {
+            let project = catalog.projects[index]
+            let path = project.directory.resolvingSymlinksInPath().path
+            guard path.hasPrefix(previousPath + "/") else { continue }
+            let relativePath = String(path.dropFirst(previousPath.count + 1))
+            catalog.projects[index] = StudioProject(id: project.id, roleID: project.roleID, name: project.name,
+                path: newRoot.appendingPathComponent(relativePath).path, created: project.created)
+            changed = true
+        }
+        if changed { try writeProjectCatalog(catalog) }
+    }
 }
