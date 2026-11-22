@@ -7,6 +7,41 @@ import XCTest
 @testable import StudioCore
 
 final class StudioCoreTests: XCTestCase {
+    func testGatewayRepairDiscardsOnlyTheDeadOwnerPointerFromTheOldHome() throws {
+        let files = FileManager.default
+        let parent = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? files.removeItem(at: parent) }
+        let store = RoleStore(root: parent.appendingPathComponent("hermesgroup"))
+        let role = Role(name: "网关验收", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let runtime = store.runtime(for: role.id)
+        let oldHome = parent.appendingPathComponent("旧角色目录")
+        let oldSocket = parent.appendingPathComponent(HermesGatewayRendezvous.fallbackDirectory(for: oldHome))
+            .appendingPathComponent("control.sock")
+        let pointer = runtime.appendingPathComponent("gateway.sock.path")
+        let owner = runtime.appendingPathComponent("gateway.pid")
+        try Data(oldSocket.path.utf8).write(to: pointer)
+        try files.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pointer.path)
+
+        func writeOwner(_ pid: Int32) throws {
+            let record = try JSONSerialization.data(withJSONObject: ["pid": pid, "hermes_home": oldHome.path])
+            try record.write(to: owner)
+        }
+
+        try writeOwner(ProcessInfo.processInfo.processIdentifier)
+        try HermesGatewayRendezvous.cleanRelocatedPointer(in: runtime)
+        XCTAssertTrue(files.fileExists(atPath: pointer.path))
+
+        let stopped = Process()
+        stopped.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try stopped.run()
+        stopped.waitUntilExit()
+        try writeOwner(stopped.processIdentifier)
+        try HermesGatewayRendezvous.cleanRelocatedPointer(in: runtime)
+        XCTAssertFalse(files.fileExists(atPath: pointer.path))
+        XCTAssertTrue(files.fileExists(atPath: owner.path))
+    }
+
     func testMovingDataRootKeepsRolesMemoryAndProjectFolders() throws {
         let files = FileManager.default
         let parent = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -24,11 +59,16 @@ final class StudioCoreTests: XCTestCase {
         thread.projectID = internalProject.id
         thread.messages = [Message(.user, "原有消息")]
         try legacy.save(thread)
+        let pointer = legacy.runtime(for: role.id).appendingPathComponent("gateway.sock.path")
+        try Data("旧地址".utf8).write(to: pointer)
 
         try destination.migrateDataIfNeeded(from: legacy.root)
         XCTAssertEqual(try destination.list(), [role])
         XCTAssertEqual(try destination.conversations(for: role.id), [thread])
         XCTAssertEqual(try destination.file(.memory, for: role.id), "原有角色记忆")
+        XCTAssertTrue(files.fileExists(atPath: pointer.path))
+        XCTAssertFalse(files.fileExists(atPath: destination.runtime(for: role.id)
+            .appendingPathComponent("gateway.sock.path").path))
         let projects = try destination.projects(for: role.id)
         let relocated = try XCTUnwrap(projects.first { $0.id == internalProject.id })
         XCTAssertTrue(relocated.path.hasPrefix(destination.root.resolvingSymlinksInPath().path + "/"))

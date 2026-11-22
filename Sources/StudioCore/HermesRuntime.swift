@@ -40,6 +40,7 @@ public struct HermesRuntime: Sendable {
 
     func prepare(home: URL, withVision: Bool, skillIDs: Set<String>?, draft: Bool,
         projectTools: Bool) throws -> [String: String] {
+        try HermesGatewayRendezvous.cleanRelocatedPointer(in: home)
         let modelValue = try config("model")
         var model = modelValue as? [String: Any] ?? ["default": modelValue as? String ?? ""]
         guard let name = model["default"] as? String, !name.isEmpty else {

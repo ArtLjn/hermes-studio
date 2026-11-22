@@ -140,6 +140,12 @@ public struct RoleStore: Sendable {
         defer { try? files.removeItem(at: staging) }
         try files.copyItem(at: legacyRoot, to: staging)
         let snapshot = RoleStore(root: staging)
+        for role in try snapshot.allRoles() {
+            for name in HermesGatewayRendezvous.copiedNames {
+                do { try files.removeItem(at: snapshot.runtime(for: role.id).appendingPathComponent(name)) }
+                catch CocoaError.fileNoSuchFile { }
+            }
+        }
         try snapshot.relocateProjectPaths(from: legacyRoot, to: root)
         do {
             try files.moveItem(at: staging, to: root)

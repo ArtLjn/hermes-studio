@@ -569,11 +569,15 @@ final class ACPConnection {
                     try send(["jsonrpc": "2.0", "id": serverID, "error": ["code": -32601, "message": "客户端不支持此方法"]])
                 }
             } else if event["id"] as? Int == id {
-                if event["error"] != nil {
+                if let failure = event["error"] as? [String: Any] {
+                    let details = (failure["data"] as? [String: Any])?["details"] as? String ?? ""
+                    if details.contains("invalid_control_pointer") {
+                        throw StudioError.message("Hermes 无法验证这个角色的本地网关地址。请从左下角重新检测本机 Hermes。")
+                    }
                     let message = switch method {
                     case "initialize": "Hermes ACP 初始化失败。"
                     case "session/load": "无法恢复 Hermes 对话。请新建对话后再试。"
-                    case "session/new": "Hermes 无法建立会话。请检查模型和认证配置。"
+                    case "session/new": "Hermes 无法建立本地会话。请从左下角重新检测本机 Hermes。"
                     case "session/set_mode": "Hermes 未能切换权限模式，请在回复结束后重试。"
                     case "session/set_model", "session/set_config_option": "Hermes 未能更新运行设置，请在回复结束后重试。"
                     default: "Hermes 未能完成本次回复。请检查模型和认证配置后重试。"
