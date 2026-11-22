@@ -146,7 +146,19 @@
 hermes acp --check
 ```
 
-### 2. 构建应用
+### 2. 安装暖光
+
+**方式一：下载 DMG**（Apple Silicon / macOS 14+）
+
+从 [Releases](https://github.com/ArtLjn/hermes-studio/releases/latest) 下载 `Hermes-Studio-<版本>-arm64.dmg`，打开后把「Hermes 暖光」拖进「应用程序」。
+
+应用只做本机临时签名、没有公证，首次打开被 Gatekeeper 拦下时右键「打开」，或执行：
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/Hermes 暖光.app"
+```
+
+**方式二：从源码构建**
 
 需要 macOS 14 或更新版本、Swift 5.10 或更新的工具链。仓库不改动任何系统设置，构建产物只落在 `dist/`。
 
