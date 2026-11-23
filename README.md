@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.11-4C5FD5?style=flat-square" alt="v0.4.11">
+  <img src="https://img.shields.io/badge/version-0.4.12-4C5FD5?style=flat-square" alt="v0.4.12">
   <img src="https://img.shields.io/badge/Swift-5.10-F05138?style=flat-square" alt="Swift 5.10">
   <img src="https://img.shields.io/badge/macOS-14%2B-1F6FEB?style=flat-square" alt="macOS 14+">
   <img src="https://img.shields.io/badge/tests-99%20%E6%9C%AC%E5%9C%B0%20%2B%2036%20%E8%81%94%E8%B0%83-2E7D32?style=flat-square" alt="99 local + 36 live tests">
@@ -50,7 +50,7 @@
 | 外观 | 石墨灰半透明材质，底色随显示器壁纸轻微变化；系统「减少透明度」时用实底 |
 | 数据 | 角色数据在 `~/hermesgroup/`，首次升级自动迁移旧目录并修正项目路径 |
 
-**当前版本：0.4.7**（`macOS/Info.plist`）
+**当前版本：0.4.12**（`macOS/Info.plist`）
 
 <a id="preview"></a>
 
