@@ -9,6 +9,7 @@ let package = Package(
         .executableTarget(name: "HermesStudio", dependencies: ["StudioCore"],
             exclude: ["Resources/desk-at-dusk.jpg"],
             resources: [.copy("Resources/app-logo.png"), .copy("Resources/Avatars")]),
+        .executableTarget(name: "StudioRoleDirectory", dependencies: ["StudioCore"]),
         .testTarget(name: "StudioCoreTests", dependencies: ["StudioCore"]),
         .testTarget(name: "HermesStudioTests", dependencies: ["HermesStudio"])
     ]

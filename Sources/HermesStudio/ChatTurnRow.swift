@@ -7,7 +7,7 @@ struct ChatTurnRow: View {
     let store: RoleStore
     let roleID: UUID
     let activity: String?
-    @State private var showingProcess = false
+    @State private var showingProcess: Bool?
 
     var body: some View {
         let running = activity != nil
@@ -20,7 +20,10 @@ struct ChatTurnRow: View {
                 if running || hasInsertion {
                     process(execution)
                 } else {
-                    DisclosureGroup(isExpanded: $showingProcess) {
+                    DisclosureGroup(isExpanded: Binding(
+                        get: { showingProcess ?? content.reply.isEmpty },
+                        set: { showingProcess = $0 }
+                    )) {
                         process(execution)
                             .padding(.top, 9)
                     } label: {
@@ -43,7 +46,7 @@ struct ChatTurnRow: View {
                 .foregroundStyle(StudioPalette.muted)
             }
         }
-        .onChange(of: running, initial: true) { _, running in
+        .onChange(of: running) { _, running in
             if !running { showingProcess = content.reply.isEmpty }
         }
     }

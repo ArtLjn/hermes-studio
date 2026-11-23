@@ -32,49 +32,20 @@ extension HermesRuntime {
         }
         defer { try? FileManager.default.removeItem(at: directory) }
 
-        let version = try? updateCommand(["acp", "--version"], timeout: min(timeout, 5),
+        let version = try? captureCommandOutput(["acp", "--version"], timeout: min(timeout, 5),
             output: directory.appendingPathComponent("version"))
         let installedVersion = version.flatMap { $0.code == 0 ? Self.version(in: $0.output) : nil }
         let status: HermesUpdateCheck.Status
         do {
-            let result = try updateCommand(["update", "--check"], timeout: timeout,
+            let result = try captureCommandOutput(["update", "--check"], timeout: timeout,
                 output: directory.appendingPathComponent("check"))
             status = Self.updateStatus(code: result.code, output: result.output)
-        } catch UpdateCommandError.timedOut {
+        } catch CapturedCommandError.timedOut {
             status = .timedOut
         } catch {
             status = .failed
         }
         return HermesUpdateCheck(installedVersion: installedVersion, status: status)
-    }
-
-    private enum UpdateCommandError: Error {
-        case failed
-        case timedOut
-    }
-
-    private func updateCommand(_ arguments: [String], timeout: TimeInterval, output: URL) throws -> (code: Int32, output: String) {
-        guard FileManager.default.createFile(atPath: output.path, contents: nil) else { throw UpdateCommandError.failed }
-        let handle = try FileHandle(forUpdating: output)
-        defer { try? handle.close() }
-
-        let command = process(arguments: arguments, overrides: ["GIT_TERMINAL_PROMPT": "0", "NO_COLOR": "1"])
-        command.standardInput = FileHandle.nullDevice
-        command.standardOutput = handle
-        let exited = DispatchSemaphore(value: 0)
-        command.terminationHandler = { _ in exited.signal() }
-        try command.run()
-        guard exited.wait(timeout: .now() + timeout) == .success else {
-            if command.isRunning { command.terminate() }
-            throw UpdateCommandError.timedOut
-        }
-        guard command.terminationReason == .exit else { throw UpdateCommandError.failed }
-
-        let end = try handle.seekToEnd()
-        let bytes: UInt64 = 65_536
-        try handle.seek(toOffset: end - min(end, bytes))
-        let data = try handle.read(upToCount: Int(bytes)) ?? Data()
-        return (command.terminationStatus, String(decoding: data, as: UTF8.self))
     }
 
     private static func updateStatus(code: Int32, output: String) -> HermesUpdateCheck.Status {

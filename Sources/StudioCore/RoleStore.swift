@@ -53,6 +53,8 @@ public struct Role: Codable, Identifiable, Equatable, Sendable {
     public var terminalSource: String?
     public var avatar: RoleAvatar?
     public var archivedAt: Date?
+    public var libraryGroup: String?
+    var libraryGroupID: UUID?
 
     public var archiveDeadline: Date? { archivedAt?.addingTimeInterval(30 * 86_400) }
 
@@ -60,6 +62,10 @@ public struct Role: Codable, Identifiable, Equatable, Sendable {
         self.name = name
         self.summary = summary
         self.template = template
+    }
+
+    public static func libraryGroupNames(in roles: [Role]) -> [String] {
+        Set(roles.compactMap(\.libraryGroup)).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 }
 
@@ -75,6 +81,11 @@ public struct Message: Codable, Identifiable, Equatable, Sendable {
     public var tool: ToolRun?
     public var isGuidance: Bool?
     public var workDuration: TimeInterval?
+    public var interrupted: Bool?
+    public var continuationOf: UUID?
+    public var handoff: RoleHandoff?
+    public var consultation: RoleConsultation?
+    public var usedGroupRecall: Bool?
 
     public init(_ author: Author, _ text: String, remoteID: String? = nil) {
         self.author = author
@@ -92,6 +103,7 @@ public struct Conversation: Codable, Identifiable, Equatable, Sendable {
     public var projectID: UUID?
     public var pinnedAt: Date?
     public var archivedAt: Date?
+    public var handoffOrigin: RoleHandoffOrigin?
     public var messages: [Message] = []
 
     public init(roleID: UUID) { self.roleID = roleID }
@@ -162,6 +174,12 @@ public struct RoleStore: Sendable {
     }
 
     private func allRoles() throws -> [Role] {
+        let records = try readRoleRecords()
+        guard let catalog = try storedLibraryCatalog() else { return records }
+        return records.map(catalog.resolve)
+    }
+
+    func readRoleRecords() throws -> [Role] {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let directory = root.appendingPathComponent("roles", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -171,8 +189,9 @@ public struct RoleStore: Sendable {
             .sorted { $0.created == $1.created ? $0.id.uuidString < $1.id.uuidString : $0.created < $1.created }
     }
 
+    @discardableResult
     public func create(_ role: Role, instructions: String, initialMemory: [RoleFile: String] = [:],
-        avatarImage: ImagePayload? = nil) throws {
+        avatarImage: ImagePayload? = nil) throws -> Role {
         let directory = roleDirectory(role.id)
         let parent = directory.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
@@ -194,8 +213,10 @@ public struct RoleStore: Sendable {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try avatarImage.data.write(to: url, options: .atomic)
         }
-        try write(role, at: staging.appendingPathComponent("role.json"))
+        let record = try assigningLibraryGroup(role, to: role.libraryGroup, createIfMissing: true)
+        try write(record, at: staging.appendingPathComponent("role.json"))
         try FileManager.default.moveItem(at: staging, to: directory)
+        return record
     }
 
     public func terminalChatRole(from home: URL) throws -> Role {
@@ -216,26 +237,71 @@ public struct RoleStore: Sendable {
         try create(role, instructions: instructions, initialMemory: [.memory: memory, .user: preferences])
     }
 
-    public func update(_ role: Role) throws {
-        try write(role, at: roleDirectory(role.id).appendingPathComponent("role.json"))
+    @discardableResult
+    public func update(_ role: Role, instructions: String? = nil, changeLibraryGroup: Bool = false) throws -> Role {
+        let profile = roleDirectory(role.id).appendingPathComponent("role.json")
+        var record = role
+        if changeLibraryGroup {
+            record = try assigningLibraryGroup(role, to: role.libraryGroup, createIfMissing: true)
+        } else {
+            let current = try roleRecord(role.id)
+            record.libraryGroup = current.libraryGroup
+            record.libraryGroupID = current.libraryGroupID
+        }
+        guard let instructions else {
+            try write(record, at: profile)
+            return record
+        }
+        let original = try file(.soul, for: role.id)
+        try writeFile(.soul, for: role.id, text: instructions)
+        do {
+            try write(record, at: profile)
+        } catch let profileError {
+            do { try writeFile(.soul, for: role.id, text: original) }
+            catch { throw StudioError.message("角色资料保存失败，原角色指令也未能恢复：\(error.localizedDescription)") }
+            throw profileError
+        }
+        return record
+    }
+
+    @discardableResult
+    public func moveRoleToLibraryGroup(_ id: UUID, to group: String?) throws -> Role? {
+        let role = try roleRecord(id)
+        guard role.archivedAt == nil, role.libraryGroup != group else { return nil }
+        let record = try assigningLibraryGroup(role, to: group, createIfMissing: false)
+        try write(record, at: roleDirectory(id).appendingPathComponent("role.json"))
+        return record
+    }
+
+    private func assigningLibraryGroup(_ role: Role, to name: String?, createIfMissing: Bool) throws -> Role {
+        let group = try name.map { try ensureLibraryGroup($0, createIfMissing: createIfMissing) }
+        var record = role
+        record.libraryGroup = group?.name
+        record.libraryGroupID = group?.id
+        return record
+    }
+
+    private func roleRecord(_ id: UUID) throws -> Role {
+        let record = try read(Role.self, at: roleDirectory(id).appendingPathComponent("role.json"))
+        return try storedLibraryCatalog()?.resolve(record) ?? record
     }
 
     public func archive(_ id: UUID, now: Date = Date()) throws -> Role {
-        var role = try read(Role.self, at: roleDirectory(id).appendingPathComponent("role.json"))
+        var role = try roleRecord(id)
         guard role.terminalSource == nil else { throw StudioError.message("终端 Hermes 的入口由本机 Hermes 管理。") }
         if role.archivedAt == nil {
             role.archivedAt = now
-            try update(role)
+            role = try update(role)
         }
         return role
     }
 
     public func restore(_ id: UUID, now: Date = Date()) throws -> Role {
-        var role = try read(Role.self, at: roleDirectory(id).appendingPathComponent("role.json"))
+        var role = try roleRecord(id)
         if let deadline = role.archiveDeadline {
             guard now < deadline else { throw StudioError.message("这个角色的 30 天恢复期限已结束。") }
             role.archivedAt = nil
-            try update(role)
+            role = try update(role)
         }
         return role
     }

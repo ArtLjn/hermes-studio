@@ -2,11 +2,13 @@ import Foundation
 
 public struct HermesRuntime: Sendable {
     public let executable: URL
-    let workers = ACPWorkerPool()
+    let workers: ACPWorkerPool
+    let acpLauncher = HermesACPLauncher()
     let completionWorker = HermesCompletionWorker()
 
-    public init(executable: URL) {
+    public init(executable: URL, idleTimeout: TimeInterval = 120, idleCapacity: Int = 2) {
         self.executable = executable
+        workers = ACPWorkerPool(idleTimeout: idleTimeout, idleCapacity: idleCapacity)
     }
 
     public static func discover() -> Self? {
@@ -33,24 +35,61 @@ public struct HermesRuntime: Sendable {
         return process
     }
 
+    enum CapturedCommandError: Error { case failed, timedOut }
+
+    func captureCommandOutput(_ arguments: [String], timeout: TimeInterval, output: URL,
+        directory: URL? = nil, overrides: [String: String] = [:],
+        standardInput: FileHandle = .nullDevice) throws -> (code: Int32, output: String) {
+        guard FileManager.default.createFile(atPath: output.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw CapturedCommandError.failed
+        }
+        let handle = try FileHandle(forUpdating: output)
+        defer { try? handle.close() }
+
+        let environment = ["GIT_TERMINAL_PROMPT": "0", "NO_COLOR": "1"].merging(overrides) { _, value in value }
+        let command = process(arguments: arguments, directory: directory, overrides: environment)
+        command.standardInput = standardInput
+        command.standardOutput = handle
+        let exited = DispatchSemaphore(value: 0)
+        command.terminationHandler = { _ in exited.signal() }
+        try HermesProcessLifetime.shared.launch(command)
+        guard exited.wait(timeout: .now() + timeout) == .success else {
+            if command.isRunning { command.terminate() }
+            throw CapturedCommandError.timedOut
+        }
+        guard command.terminationReason == .exit else { throw CapturedCommandError.failed }
+
+        let end = try handle.seekToEnd()
+        let bytes: UInt64 = 65_536
+        try handle.seek(toOffset: end - min(end, bytes))
+        let data = try handle.read(upToCount: Int(bytes)) ?? Data()
+        return (command.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
     public func currentModel() throws -> String {
         let model = try config("model", raw: false)
         return (model as? [String: Any])?["default"] as? String ?? model as? String ?? ""
     }
 
     func prepare(home: URL, withVision: Bool, skillIDs: Set<String>?, draft: Bool,
-        projectTools: Bool) throws -> [String: String] {
+        mcpServers: [MCPServer.Connection] = [], proxyRange: String? = nil,
+        toolsets: [String]? = nil, budget: HermesGenerationBudget? = nil) throws -> [String: String] {
         try HermesGatewayRendezvous.cleanRelocatedPointer(in: home)
-        let modelValue = try config("model")
+        let snapshot = launchConfiguration(credentialKeys: Set(Self.providerKeys.values.flatMap { $0 }))
+        let modelValue = try snapshot.map { $0["model"] ?? "" } ?? config("model")
+        let setting: (String) -> Any? = { key in
+            if let snapshot { return snapshot[key] }
+            return try? config(key, raw: key != "skills")
+        }
         var model = modelValue as? [String: Any] ?? ["default": modelValue as? String ?? ""]
         guard let name = model["default"] as? String, !name.isEmpty else {
             throw StudioError.message("请先在 Hermes 中设置默认模型。")
         }
 
         let provider = (model["provider"] as? String ?? "").lowercased()
-        let vision = withVision ? (try? config("auxiliary.vision")) as? [String: Any] : nil
+        let vision = withVision ? setting("auxiliary.vision") as? [String: Any] : nil
         let visionProvider = (vision?["provider"] as? String ?? "").lowercased()
-        let custom = (try? config("custom_providers")) as? [[String: Any]] ?? []
+        let custom = setting("custom_providers") as? [[String: Any]] ?? []
         let names = [provider, visionProvider].map { $0.replacingOccurrences(of: "custom:", with: "", options: .anchored) }
         var selected = custom.filter {
             guard let name = ($0["name"] as? String)?.lowercased() else { return false }
@@ -64,7 +103,7 @@ public struct HermesRuntime: Sendable {
         try attachInstalledDependencies(to: home, environment: &env)
         let credentialKeys = Set((Self.providerKeys[provider] ?? []) + (Self.providerKeys[visionProvider] ?? []))
         for key in credentialKeys {
-            if let value = (try? config(key)) as? String, !value.isEmpty {
+            if let value = setting(key) as? String, !value.isEmpty {
                 env[key] = value
             }
         }
@@ -96,7 +135,9 @@ public struct HermesRuntime: Sendable {
             }
         }
         model = hideCredentials(model)
-        let skills = draft ? (directories: [URL](), disabled: Set<String>()) : skillConfiguration()
+        if let budget { model["max_tokens"] = budget.outputTokens }
+        let skills = draft ? (directories: [URL](), disabled: Set<String>())
+            : skillConfiguration(settings: setting("skills") as? [String: Any] ?? [:])
         var disabled = skills.disabled
         var skillDirectories = skills.directories
         if let skillIDs, !skillIDs.isEmpty {
@@ -109,13 +150,11 @@ public struct HermesRuntime: Sendable {
             }
             skillDirectories = try exposeSelectedSkills(enabled, in: home)
         }
-        var toolsets = draft ? [] : ["memory", "session_search"]
-        if !draft, skillIDs?.isEmpty != true { toolsets.append("skills") }
-        if !draft, projectTools { toolsets += ["file", "terminal"] }
         var runtimeConfig: [String: Any] = [
             "model": model,
             "custom_providers": selected.map(hideCredentials),
-            "platform_toolsets": ["acp": toolsets],
+            // 普通对话随 Hermes 的原生工具目录更新，内部草稿请求只需要生成文字。
+            "platform_toolsets": ["acp": toolsets ?? (draft ? mcpServers.map(\.name) : ["all"])],
             "display": ["busy_input_mode": "queue"],
             "skills": [
                 "external_dirs": skillIDs?.isEmpty == true ? [] : skillDirectories.map(\.path),
@@ -126,19 +165,53 @@ public struct HermesRuntime: Sendable {
                 "write_approval": true
             ],
             "memory": ["memory_enabled": !draft, "user_profile_enabled": !draft, "provider": ""],
-            "curator": ["enabled": false]
+            "curator": ["enabled": false],
+            "gateway": ["unmanaged_idle_exit_seconds": 120]
         ]
+        if !draft, skillIDs?.isEmpty == true { runtimeConfig["agent"] = ["disabled_toolsets": ["skills"]] }
+        if let budget {
+            var agent = runtimeConfig["agent"] as? [String: Any] ?? [:]
+            agent["max_turns"] = budget.iterations
+            runtimeConfig["agent"] = agent
+        }
+        if !draft {
+            for section in ["web", "browser"] {
+                if let settings = setting(section) as? [String: Any], !settings.isEmpty {
+                    runtimeConfig[section] = hideCredentials(settings)
+                }
+            }
+            let declared = setting("security.fake_ip_ranges")
+            let ranges = (declared as? [String]) ?? (declared as? String).map { [$0] } ?? []
+            let fakeIPRanges = ranges.isEmpty ? proxyRange.map { [$0] } ?? [] : ranges
+            if !fakeIPRanges.isEmpty { runtimeConfig["security"] = ["fake_ip_ranges": fakeIPRanges] }
+        }
         if let vision { runtimeConfig["auxiliary"] = ["vision": hideCredentials(vision)] }
+        let managesMCP = !mcpServers.isEmpty || (!draft && usesStudioMCP(home: home))
+        if managesMCP {
+            runtimeConfig["mcp_servers"] = Dictionary(mcpServers.map { ($0.name, $0.hermesConfig) },
+                uniquingKeysWith: { first, _ in first })
+        }
         let data = try JSONSerialization.data(withJSONObject: runtimeConfig, options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: home.appendingPathComponent("config.yaml"), options: .atomic)
+        let configURL = home.appendingPathComponent("config.yaml")
+        if managesMCP {
+            try MCPStore.writePrivate(data, to: configURL)
+        } else {
+            try data.write(to: configURL, options: .atomic)
+        }
         return env
+    }
+
+    func usesStudioMCP(home: URL) -> Bool {
+        guard let data = try? Data(contentsOf: home.appendingPathComponent("config.yaml")),
+            let config = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return false }
+        return config["mcp_servers"] is [String: Any]
     }
 
     public func terminalHome() -> URL? {
         let output = Pipe()
         let command = process(arguments: ["config", "path"])
         command.standardOutput = output
-        guard (try? command.run()) != nil else { return nil }
+        guard (try? HermesProcessLifetime.shared.launch(command)) != nil else { return nil }
         let data = output.fileHandleForReading.readDataToEndOfFile()
         command.waitUntilExit()
         let path = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -150,7 +223,7 @@ public struct HermesRuntime: Sendable {
         let output = Pipe()
         let process = process(arguments: ["-p", "default", "config", "get", "--json"] + (raw ? ["--raw"] : []) + [key])
         process.standardOutput = output
-        try process.run()
+        try HermesProcessLifetime.shared.launch(process)
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0,
@@ -186,7 +259,10 @@ public struct HermesRuntime: Sendable {
     }
 
     func skillConfiguration() -> (directories: [URL], disabled: Set<String>) {
-        let settings = (try? config("skills", raw: false)) as? [String: Any] ?? [:]
+        skillConfiguration(settings: (try? config("skills", raw: false)) as? [String: Any] ?? [:])
+    }
+
+    private func skillConfiguration(settings: [String: Any]) -> (directories: [URL], disabled: Set<String>) {
         let disabled = settings["disabled"] as? [String] ?? []
         let platform = (settings["platform_disabled"] as? [String: [String]])?["acp"] ?? []
         let external = (settings["external_dirs"] as? [String] ?? []).map { path in

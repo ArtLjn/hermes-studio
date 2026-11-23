@@ -3,7 +3,14 @@ import SwiftUI
 
 struct ToolPermissionCard: View {
     let permission: ToolPermission
-    let respond: (String?) -> Void
+    let editPolicy: String?
+    let workspace: URL?
+    let workspaceName: String
+    let stop: () -> Void
+    let respond: (String) -> Void
+    @State private var showsOtherOptions = false
+
+    private var isClarification: Bool { permission.kind == "clarify" }
 
     private var heading: (String, String) {
         switch permission.kind {
@@ -18,10 +25,41 @@ struct ToolPermissionCard: View {
         }
     }
 
-    private var allow: ToolPermission.Option? { permission.options.first { $0.kind == "allow_once" } }
+    private var allow: ToolPermission.Option? {
+        isClarification ? nil : permission.options.first { $0.kind == "allow_once" }
+    }
     private var deny: ToolPermission.Option? { permission.options.first { $0.kind == "reject_once" } }
+    private var sessionAllow: ToolPermission.Option? {
+        permission.options.first { $0.id == "allow_session" }
+    }
     private var otherOptions: [ToolPermission.Option] {
-        permission.options.filter { $0.id != allow?.id && $0.id != deny?.id }
+        permission.options.filter { $0.id != allow?.id && $0.id != deny?.id && $0.id != sessionAllow?.id }
+    }
+    private var skip: ToolPermission.Option? {
+        permission.options.first { $0.id == "skip" } ?? deny
+    }
+    private var clarificationOptions: [ToolPermission.Option] {
+        permission.options.filter { $0.id != skip?.id }
+    }
+
+    private var scopeNote: String? {
+        guard permission.kind == "edit" else { return nil }
+        switch editPolicy {
+        case "workspace_session", "accept_edits":
+            if let workspace, let path = permission.edit?.path, path.hasPrefix("/"),
+                !path.contains(", "), !path.contains(where: \.isNewline) {
+                let target = URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath()
+                if !target.pathComponents.starts(with: workspace.resolvingSymlinksInPath().pathComponents) {
+                    return "目标在「\(workspaceName)」工作区外，这次编辑需要单独确认。"
+                }
+            }
+            return "自动范围为「\(workspaceName)」和 Hermes 临时目录内的普通编辑。"
+        case "session", "dont_ask":
+            return "Hermes 要求对这次修改单独确认。"
+        case "ask", "default":
+            return "手动模式下，每次文件修改都需要确认。"
+        default: return nil
+        }
     }
 
     var body: some View {
@@ -29,11 +67,28 @@ struct ToolPermissionCard: View {
             VStack(alignment: .leading, spacing: 9) {
                 Label(heading.0, systemImage: heading.1)
                     .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(isClarification ? StudioPalette.muted : StudioPalette.ink)
                     .accessibilityAddTraits(.isHeader)
                 evidence
+                if let scopeNote {
+                    Text(scopeNote)
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioPalette.muted)
+                        .help(workspace?.path ?? workspaceName)
+                }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
+
+            if isClarification && !clarificationOptions.isEmpty {
+                ViewThatFits(in: .vertical) {
+                    clarificationList.fixedSize(horizontal: false, vertical: true)
+                    ScrollView { clarificationList }
+                }
+                .frame(maxHeight: 178)
+                .padding(.horizontal, 7)
+                .padding(.bottom, 5)
+            }
 
             StudioRule()
             actions
@@ -56,38 +111,128 @@ struct ToolPermissionCard: View {
         } else {
             if permission.kind != "execute" || permission.title != permission.details {
                 Text(permission.title)
-                    .font(.system(size: 12))
+                    .font(.system(size: isClarification ? 13 : 12))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if permission.kind != "clarify", let details = permission.details,
                 permission.kind == "execute" || details != permission.title {
-                PermissionContentPreview(text: details)
+                if permission.kind == "execute" {
+                    ScrollView {
+                        Text(verbatim: details)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(height: 65)
+                    .background(StudioPalette.background, in: RoundedRectangle(cornerRadius: 6))
+                } else {
+                    PermissionContentPreview(text: details)
+                }
             }
         }
     }
 
     private var actions: some View {
         HStack(spacing: 7) {
-            Button("取消请求") { respond(nil) }
-                .buttonStyle(StudioRowButton())
-                .font(.system(size: 11))
-                .foregroundStyle(StudioPalette.muted)
-                .padding(.horizontal, 3)
-                .padding(.vertical, 4)
+            stopButton
             Spacer(minLength: 4)
-            if !otherOptions.isEmpty {
-                Menu(allow == nil && deny == nil ? "选择回应" : "更多选项") {
-                    ForEach(otherOptions) { option in
-                        Button(optionLabel(option)) { respond(option.id) }
-                    }
+            if isClarification {
+                if let skip {
+                    Button(optionLabel(skip)) { respond(skip.id) }
+                        .buttonStyle(QuietButton())
+                        .fixedSize()
                 }
-                .menuStyle(.borderlessButton)
+            } else {
+                choices
+            }
+        }
+    }
+
+    private var clarificationList: some View {
+        VStack(spacing: 0) {
+            ForEach(clarificationOptions) { option in
+                if option.id != clarificationOptions.first?.id {
+                    StudioRule().padding(.horizontal, 8)
+                }
+                clarificationRow(option)
+            }
+        }
+    }
+
+    private func clarificationRow(_ option: ToolPermission.Option) -> some View {
+        let name = option.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let marker = ["(Recommended)", "（推荐）"].first { name.hasSuffix($0) && name.count > $0.count }
+        let title = marker.map { name.dropLast($0.count).trimmingCharacters(in: .whitespacesAndNewlines) } ?? name
+        return Button { respond(option.id) } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 9) {
+                Text(verbatim: title)
+                    .font(.system(size: 12))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                if marker != nil {
+                    Text("推荐")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(StudioPalette.accent)
+                        .fixedSize()
+                }
+                Image(systemName: "arrow.turn.down.left")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(StudioPalette.muted)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+        }
+        .buttonStyle(StudioRowButton())
+    }
+
+    private var stopButton: some View {
+        Button("停止本轮", action: stop)
+            .buttonStyle(StudioRowButton())
+            .font(.system(size: 11))
+            .foregroundStyle(StudioPalette.muted)
+            .padding(.horizontal, 3)
+            .padding(.vertical, 4)
+            .fixedSize()
+    }
+
+    private var choices: some View {
+        HStack(spacing: 7) {
+            if !otherOptions.isEmpty {
+                Button(allow == nil && deny == nil ? "选择回应" : "更多选项") {
+                    showsOtherOptions.toggle()
+                }
+                .buttonStyle(QuietButton())
                 .fixedSize()
+                .popover(isPresented: $showsOtherOptions, arrowEdge: .top) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(otherOptions) { option in
+                            Button {
+                                showsOtherOptions = false
+                                respond(option.id)
+                            } label: {
+                                Text(optionLabel(option))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(QuietButton())
+                        }
+                    }
+                    .frame(minWidth: 160, maxWidth: 280)
+                    .padding(6)
+                }
             }
             if let deny {
                 Button(optionLabel(deny)) { respond(deny.id) }
                     .buttonStyle(QuietButton())
+                    .fixedSize()
+            }
+            if let sessionAllow {
+                Button("本次会话允许") { respond(sessionAllow.id) }
+                    .buttonStyle(QuietButton())
+                    .fixedSize()
+                    .help("在当前会话中允许 Hermes 识别出的同类操作")
             }
             if let allow {
                 StudioPrimaryButton(title: optionLabel(allow), symbol: "checkmark") { respond(allow.id) }
@@ -96,12 +241,12 @@ struct ToolPermissionCard: View {
     }
 
     private func optionLabel(_ option: ToolPermission.Option) -> String {
-        switch option.id {
+        if permission.toolID.hasPrefix("model-confirm-") { return option.name }
+        return switch option.id {
         case "allow_once": "仅允许这一次"
-        case "allow_session": "本次会话允许"
-        case "allow_always": "始终允许"
-        case "deny": "拒绝"
-        case "deny_always": "始终拒绝"
+        case "allow_always": "以后允许同类操作"
+        case "deny": "拒绝本次"
+        case "deny_always": "以后拒绝同类操作"
         case "skip": "跳过"
         default: option.name
         }

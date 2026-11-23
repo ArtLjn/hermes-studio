@@ -20,6 +20,8 @@ struct ManagementRoleCard: View {
     let edit: () -> Void
     let editFile: (RoleFile) -> Void
     let archive: () -> Void
+    let libraryGroups: [String]
+    let moveToGroup: (String?) -> Void
     @State private var hovered = false
 
     var body: some View {
@@ -76,6 +78,15 @@ struct ManagementRoleCard: View {
                     action: togglePin)
                 Divider()
                 Button("编辑角色资料", action: edit)
+                if !libraryGroups.isEmpty {
+                    Menu("移到分组") {
+                        Button("未分组") { moveToGroup(nil) }.disabled(role.libraryGroup == nil)
+                        Divider()
+                        ForEach(libraryGroups, id: \.self) { group in
+                            Button(group) { moveToGroup(group) }.disabled(role.libraryGroup == group)
+                        }
+                    }
+                }
                 ForEach(RoleFile.allCases) { file in
                     Button("编辑\(file.label)") { editFile(file) }
                 }

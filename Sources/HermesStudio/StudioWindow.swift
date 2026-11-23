@@ -8,6 +8,7 @@ struct StudioWindow: View {
     @AppStorage("studio.showInspector") private var showInspector = true
     @State private var sheet: StudioSheet?
     @State private var managementPage = ManagementPage.overview
+    @State private var groupSpaceOpen = false
 
     private var panelAnimation: Animation? { reduceMotion ? nil : .easeInOut(duration: 0.20) }
     private var showsConversationSidebar: Bool { !studio.showManagement && showSidebar }
@@ -26,7 +27,9 @@ struct StudioWindow: View {
                         ChatSidebar(studio: studio, createProject: { sheet = .project($0) })
                     }
                 }
-                if studio.showManagement {
+                if studio.showManagement && groupSpaceOpen {
+                    GroupWorkspace(studio: studio, model: studio.groupWorkspace)
+                } else if studio.showManagement {
                     ManagementPane(studio: studio, page: $managementPage, toolbarLeading: toolbarLeading,
                         create: { sheet = .create }, edit: { sheet = .edit($0) }, details: { sheet = .details($0) },
                         terminalDetails: { sheet = .terminal($0) }, editFile: { sheet = .file($0, $1) },
@@ -97,9 +100,17 @@ struct StudioWindow: View {
             }
             ForEach(ManagementPage.destinations, id: \.self) { page in
                 railButton(page.rawValue, symbol: page.icon,
-                    selected: (studio.showManagement ? managementPage.navigationRoot : .overview) == page) {
+                    selected: !groupSpaceOpen && (studio.showManagement ? managementPage.navigationRoot : .overview) == page) {
                     openManagement(page)
                 }
+            }
+            railButton("群聊", symbol: "person.3", selected: groupSpaceOpen && studio.showManagement) {
+                groupSpaceOpen = true
+                studio.goHome()
+            }
+            .overlay(alignment: .topTrailing) {
+                GroupProposalIndicator(model: studio.groupWorkspace)
+                    .allowsHitTesting(false)
             }
             if !studio.showManagement && !showSidebar {
                 StudioRule().padding(.horizontal, 12).padding(.vertical, 4)
@@ -132,6 +143,7 @@ struct StudioWindow: View {
     }
 
     private func openManagement(_ page: ManagementPage) {
+        groupSpaceOpen = false
         managementPage = page
         if !studio.showManagement { studio.goHome() }
     }
@@ -186,6 +198,20 @@ struct StudioWindow: View {
             onDetails: { sheet = .details(role) },
             onEditFile: { sheet = .file(role, $0) })
             .id(role.id)
+    }
+}
+
+private struct GroupProposalIndicator: View {
+    @ObservedObject var model: GroupWorkspaceModel
+
+    var body: some View {
+        if !model.pendingProposals.isEmpty {
+            Circle()
+                .fill(StudioPalette.accent)
+                .frame(width: 5, height: 5)
+                .padding(5)
+                .accessibilityLabel("有待确认的建群提案")
+        }
     }
 }
 

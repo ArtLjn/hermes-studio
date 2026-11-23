@@ -118,7 +118,7 @@ final class HermesCompletionWorker: @unchecked Sendable {
             let input = Pipe(), output = Pipe()
             process.standardInput = input
             process.standardOutput = output
-            try process.run()
+            try HermesProcessLifetime.shared.launch(process)
             let rpc = ACPConnection(input: input.fileHandleForWriting, output: output.fileHandleForReading)
             connection = (process, rpc, home)
             return rpc

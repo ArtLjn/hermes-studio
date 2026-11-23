@@ -13,7 +13,8 @@ struct ChatMessageRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: isUser ? 5 : 9) {
             if isUser {
-                if message.isGuidance == true || message.skill != nil { header }
+                if message.isGuidance == true || message.skill != nil || message.handoff != nil
+                    || message.consultation != nil { header }
             } else if message.author != .assistant || showsAssistantHeader {
                 header
             }
@@ -33,6 +34,16 @@ struct ChatMessageRow: View {
                 } else {
                     Text(message.text).font(.system(size: 14)).lineSpacing(4).textSelection(.enabled)
                 }
+            }
+            if let context = message.consultation?.context, !context.isEmpty {
+                DisclosureGroup("附带了 \(context.count) 条前文") {
+                    VStack(alignment: .leading, spacing: 9) {
+                        ForEach(context) { entry in ConsultationContextExcerpt(entry: entry) }
+                    }
+                    .padding(.top, 5)
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(StudioPalette.muted)
             }
         }
         .padding(.horizontal, isUser ? 13 : 0)
@@ -56,6 +67,15 @@ struct ChatMessageRow: View {
                     .fontWeight(.semibold)
                     .foregroundStyle(isUser ? StudioPalette.muted : StudioPalette.ink)
             }
+            if let handoff = message.handoff {
+                Label(handoff.isQuestion == true ? "拟一条给\(handoff.targetName)的问题" : "准备交接给\(handoff.targetName)",
+                    systemImage: "person.2")
+                    .foregroundStyle(StudioPalette.accent)
+            }
+            if let consultation = message.consultation {
+                Label("向\(consultation.targetName)提问", systemImage: "bubble.left")
+                    .foregroundStyle(StudioPalette.accent)
+            }
             if let skill = message.skill {
                 Label(skill, systemImage: "puzzlepiece")
                     .font(.system(size: 10))
@@ -75,35 +95,38 @@ struct ChatMessageRow: View {
         .font(.system(size: isUser ? 11 : 12))
     }
 
+    @ViewBuilder
     private func attachment(_ attachment: ChatImage) -> some View {
         let url = store.imageURL(attachment, for: roleID)
-        return Button {
-            NSWorkspace.shared.open(url)
-        } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                if let image = NSImage(contentsOf: url) {
+        if let image = NSImage(contentsOf: url) {
+            ChatImagePreviewButton(name: attachment.name, image: image, fileURL: url) {
+                attachmentCard(attachment.name) {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
                         .frame(width: 140, height: 101)
                         .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-                } else {
-                    Label("图片不可用", systemImage: "photo")
                 }
-                Text(attachment.name)
-                    .lineLimit(1)
-                    .font(.system(size: 10))
-                    .foregroundStyle(StudioPalette.muted)
             }
-            .padding(6)
-            .background(StudioPalette.raised, in: RoundedRectangle(cornerRadius: 7))
+        } else {
+            attachmentCard(attachment.name) { Label("图片不可用", systemImage: "photo") }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("打开图片 \(attachment.name)")
+    }
+
+    private func attachmentCard(_ name: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            content()
+            Text(name)
+                .lineLimit(1)
+                .font(.system(size: 10))
+                .foregroundStyle(StudioPalette.muted)
+        }
+        .padding(6)
+        .background(StudioPalette.raised, in: RoundedRectangle(cornerRadius: 7))
     }
 }
 
-private struct MarkdownReply: View {
+struct MarkdownReply: View {
     let text: String
 
     var body: some View {

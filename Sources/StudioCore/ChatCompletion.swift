@@ -4,7 +4,8 @@ public enum ChatCompletion {
     public static func suffix(for prefix: String, in threads: [Conversation], roleID: UUID, projectID: UUID?) -> String? {
         guard let currentLine = currentLine(in: prefix) else { return nil }
         for thread in threads where thread.roleID == roleID && thread.projectID == projectID {
-            for message in thread.messages.reversed() where message.author == .user {
+            let messages = thread.messages.dropFirst(thread.handoffOrigin == nil ? 0 : 1)
+            for message in messages.reversed() where message.author == .user && message.consultation == nil {
                 for line in message.text.split(whereSeparator: \.isNewline).reversed() {
                     guard let suffix = remainder(after: currentLine, in: line) else { continue }
                     return suffix.isEmpty ? nil : suffix

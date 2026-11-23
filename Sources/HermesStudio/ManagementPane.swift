@@ -6,10 +6,11 @@ enum ManagementPage: String {
     case roles = "角色库"
     case projects = "项目"
     case conversations = "对话记录"
+    case mcp = "MCP 管理"
     case archivedChats = "已归档对话"
     case drafts = "角色草稿箱"
 
-    static let destinations: [Self] = [.overview, .roles, .projects, .conversations]
+    static let destinations: [Self] = [.overview, .roles, .projects, .conversations, .mcp]
 
     var navigationRoot: Self {
         switch self {
@@ -25,9 +26,43 @@ enum ManagementPage: String {
         case .roles: "person.2"
         case .projects: "folder"
         case .conversations: "clock"
+        case .mcp: "point.3.connected.trianglepath.dotted"
         case .archivedChats: "archivebox"
         case .drafts: "tray"
         }
+    }
+}
+
+enum ConversationBatch {
+    static let size = 8
+
+    static func nextVisibleCount(current: Int, total: Int) -> Int {
+        min(current + size, total)
+    }
+}
+
+enum RoleLibraryFilter: Equatable {
+    case all, ungrouped, group(String)
+
+    var title: String {
+        switch self {
+        case .all: "全部分组"
+        case .ungrouped: "未分组"
+        case .group(let name): name
+        }
+    }
+
+    func includes(group: String?) -> Bool {
+        switch self {
+        case .all: true
+        case .ungrouped: group == nil
+        case .group(let name): group == name
+        }
+    }
+
+    func matches(_ role: Role, query: String) -> Bool {
+        includes(group: role.libraryGroup) && (query.isEmpty || role.name.localizedCaseInsensitiveContains(query)
+            || role.summary.localizedCaseInsensitiveContains(query) || role.libraryGroup?.localizedCaseInsensitiveContains(query) == true)
     }
 }
 
@@ -43,7 +78,11 @@ struct ManagementPane: View {
     let createProject: (Role) -> Void
     @State private var roleQuery = ""
     @State private var conversationQuery = ""
+    @State private var visibleConversationCount = ConversationBatch.size
     @State private var pinnedOnly = false
+    @State private var libraryFilter: RoleLibraryFilter = .all
+    @State private var creatingLibraryGroup = false
+    @State private var dissolvingLibraryGroup: String?
     @State private var previewingArchive: UUID?
     @FocusState private var searchFocused: Bool
 
@@ -61,16 +100,30 @@ struct ManagementPane: View {
     private var matchingRoles: [Role] {
         let query = roleQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         return orderedRoles.filter { role in
-            (!pinnedOnly || role.pinned == true) && (query.isEmpty
-                || role.name.localizedCaseInsensitiveContains(query) || role.summary.localizedCaseInsensitiveContains(query))
+            (!pinnedOnly || role.pinned == true) && libraryFilter.matches(role, query: query)
         }
     }
+
+    private var libraryGroups: [String] { studio.libraryGroups }
 
     private var matchingThreads: [Conversation] {
         let query = conversationQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         if query.isEmpty { return studio.recentThreads }
         let matchingIDs = Set(studio.roles.filter { $0.name.localizedCaseInsensitiveContains(query) }.map(\.id))
         return studio.recentThreads.filter { $0.title.localizedCaseInsensitiveContains(query) || matchingIDs.contains($0.roleID) }
+    }
+
+    private var visibleThreads: ArraySlice<Conversation> {
+        matchingThreads.prefix(visibleConversationCount)
+    }
+
+    private var hasMoreConversations: Bool {
+        visibleThreads.count < matchingThreads.count
+    }
+
+    private func loadMoreConversations() {
+        visibleConversationCount = ConversationBatch.nextVisibleCount(
+            current: visibleConversationCount, total: matchingThreads.count)
     }
 
     private var archivedPage: some View {
@@ -116,6 +169,10 @@ struct ManagementPane: View {
                                     ForEach(ChatTurn.collect(thread.messages)) { turn in
                                         ChatTurnRow(turn: turn, role: role, store: studio.store,
                                             roleID: role.id, activity: nil)
+                                        if let consultation = turn.request?.consultation {
+                                            RoleConsultationReply(consultation: consultation,
+                                                role: studio.consultationRole(consultation), store: studio.store)
+                                        }
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -145,6 +202,8 @@ struct ManagementPane: View {
                     case .roles: catalog
                     case .projects: ProjectPane(studio: studio, create: createProject)
                     case .conversations: conversationList
+                    case .mcp:
+                        MCPManagementPane(management: studio.mcp, roles: studio.roles, test: studio.testMCP)
                     case .archivedChats: archivedPage
                     case .drafts: RoleDraftBox(studio: studio)
                     }
@@ -165,6 +224,13 @@ struct ManagementPane: View {
         .onChange(of: studio.roles.count) { _, _ in
             roleQuery = ""
             pinnedOnly = false
+        }
+        .onChange(of: libraryGroups) { _, groups in
+            if groups.isEmpty { libraryFilter = .all }
+            else if case .group(let name) = libraryFilter, !groups.contains(name) { libraryFilter = .all }
+        }
+        .onChange(of: page) { _, _ in
+            visibleConversationCount = ConversationBatch.size
         }
     }
 
@@ -209,20 +275,134 @@ struct ManagementPane: View {
                 Spacer()
                 searchBox("搜索角色", query: $roleQuery)
             }
+            RoleLibraryGroupBar(groups: libraryGroups, selection: $libraryFilter,
+                create: { creatingLibraryGroup = true }, receive: dropLibraryItem)
             let query = roleQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+            let terminalGroup = studio.terminalHome.flatMap { studio.linkedTerminalRole(for: $0)?.libraryGroup }
             let terminal = pinnedOnly ? nil : studio.terminalHome.flatMap { home in
+                guard libraryFilter.includes(group: terminalGroup) else { return nil as URL? }
                 let linked = studio.linkedTerminalRole(for: home)
                 return query.isEmpty || "终端 Hermes".localizedCaseInsensitiveContains(query)
-                    || linked?.name.localizedCaseInsensitiveContains(query) == true
-                    || linked?.summary.localizedCaseInsensitiveContains(query) == true || home.path.localizedCaseInsensitiveContains(query)
+                    || linked.map { libraryFilter.matches($0, query: query) } == true || home.path.localizedCaseInsensitiveContains(query)
                     ? home : nil
             }
-            if matchingRoles.isEmpty && terminal == nil {
+            if matchingRoles.isEmpty && terminal == nil && (!query.isEmpty || pinnedOnly) {
                 emptyState(pinnedOnly && roleQuery.isEmpty ? "还没有置顶角色" : "没有匹配的角色",
                     icon: pinnedOnly && roleQuery.isEmpty ? "pin" : "magnifyingglass")
             } else {
-                roleGrid(matchingRoles, terminalHome: terminal)
+                libraryGrids(matchingRoles, terminalHome: terminal, terminalGroup: terminalGroup,
+                    showsEmptyGroups: query.isEmpty && !pinnedOnly)
             }
+        }
+        .sheet(isPresented: $creatingLibraryGroup) {
+            NewRoleLibraryGroup { name in
+                _ = try studio.createLibraryGroup(name)
+                libraryFilter = .all
+                pinnedOnly = false
+                roleQuery = ""
+            }
+        }
+        .alert("解散分组", isPresented: Binding(get: { dissolvingLibraryGroup != nil },
+            set: { if !$0 { dissolvingLibraryGroup = nil } }), presenting: dissolvingLibraryGroup) { group in
+            Button("取消", role: .cancel) {}
+            Button("解散", role: .destructive) { studio.dissolveLibraryGroup(group) }
+        } message: { group in
+            Text("「\(group)」里的角色将移回「未分组」，角色资料和对话都会保留。")
+        }
+    }
+
+    @ViewBuilder
+    private func libraryGrids(_ roles: [Role], terminalHome: URL?, terminalGroup: String?, showsEmptyGroups: Bool) -> some View {
+        switch libraryFilter {
+        case .all where libraryGroups.isEmpty && (!roles.isEmpty || terminalHome != nil):
+            roleGrid(roles, terminalHome: terminalHome)
+        case .all:
+            let grouped = Dictionary(grouping: roles, by: \.libraryGroup)
+            ForEach(libraryGroups, id: \.self) { group in
+                let members = grouped[group] ?? []
+                let linkedHome = terminalGroup == group ? terminalHome : nil
+                if showsEmptyGroups || !members.isEmpty || linkedHome != nil {
+                    roleSection(group, roles: members, terminalHome: linkedHome)
+                }
+            }
+            if grouped[nil]?.isEmpty == false || (terminalGroup == nil && terminalHome != nil) || (libraryGroups.isEmpty && showsEmptyGroups) {
+                roleSection(nil, roles: grouped[nil] ?? [], terminalHome: terminalGroup == nil ? terminalHome : nil)
+            }
+        case .ungrouped:
+            roleSection(nil, roles: roles, terminalHome: terminalHome)
+        case .group(let group):
+            roleSection(group, roles: roles, terminalHome: terminalHome)
+        }
+    }
+
+    private func roleSection(_ group: String?, roles: [Role], terminalHome: URL?) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                if let group {
+                    Image(systemName: "line.3.horizontal")
+                        .font(.system(size: 12))
+                        .foregroundStyle(StudioPalette.muted)
+                        .frame(width: 21, height: 28)
+                        .contentShape(Rectangle())
+                        .draggable(RoleLibraryDrag.group(group))
+                        .accessibilityLabel("拖动\(group)排序")
+                        .help("拖动到其他分组调整顺序")
+                } else {
+                    Image(systemName: "tray")
+                        .font(.system(size: 12))
+                        .foregroundStyle(StudioPalette.muted)
+                        .frame(width: 21, height: 28)
+                        .accessibilityHidden(true)
+                }
+                sectionTitle(group ?? "未分组", count: roles.count + (terminalHome == nil ? 0 : 1))
+                    .accessibilityAddTraits(.isHeader)
+                Spacer(minLength: 8)
+                if let group { libraryGroupActions(group) }
+            }
+            .padding(.horizontal, 4)
+            .frame(minHeight: 30)
+            if roles.isEmpty && terminalHome == nil {
+                Label(group == nil ? "拖到这里，移回未分组" : "将角色拖到这里", systemImage: "plus.circle")
+                    .font(.system(size: 12))
+                    .foregroundStyle(StudioPalette.muted)
+                    .frame(maxWidth: .infinity, minHeight: 53)
+                    .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(StudioPalette.outline,
+                        style: StrokeStyle(lineWidth: 1, dash: [4, 4])).allowsHitTesting(false) }
+            } else {
+                roleGrid(roles, terminalHome: terminalHome)
+            }
+        }
+        .modifier(RoleLibraryDropZone(group: group, receive: dropLibraryItem))
+    }
+
+    private func libraryGroupActions(_ group: String) -> some View {
+        let index = libraryGroups.firstIndex(of: group)
+        return Menu {
+            Button("上移", systemImage: "arrow.up") {
+                if let index, index > 0 { studio.reorderLibraryGroup(group, to: libraryGroups[index - 1]) }
+            }
+            .disabled((index ?? 0) == 0)
+            Button("下移", systemImage: "arrow.down") {
+                if let index, index + 1 < libraryGroups.count { studio.reorderLibraryGroup(group, to: libraryGroups[index + 1]) }
+            }
+            .disabled((index ?? libraryGroups.count) + 1 >= libraryGroups.count)
+            Divider()
+            Button("解散分组", systemImage: "folder.badge.minus", role: .destructive) { dissolvingLibraryGroup = group }
+        } label: {
+            Image(systemName: "ellipsis").font(.system(size: 14, weight: .medium)).frame(width: 27, height: 22)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityLabel("管理\(group)分组")
+    }
+
+    private func dropLibraryItem(_ item: RoleLibraryDrag, on group: String?) -> Bool {
+        switch item {
+        case .role(let id): return studio.moveRole(id, to: group)
+        case .group(let name):
+            guard let group else { return false }
+            return studio.reorderLibraryGroup(name, to: group)
         }
     }
 
@@ -241,15 +421,30 @@ struct ManagementPane: View {
                 emptyState(conversationQuery.isEmpty ? "还没有对话记录" : "没有匹配的对话", icon: "bubble.left.and.bubble.right")
             } else {
                 LazyVStack(spacing: 0) {
-                    ForEach(matchingThreads) { thread in
+                    ForEach(visibleThreads) { thread in
                         if let role = role(for: thread) {
                             WorkspaceConversationRow(thread: thread, role: role, studio: studio)
                             StudioRule()
                         }
                     }
+                    if hasMoreConversations {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                                .accessibilityHidden(true)
+                            Text("正在加载更多对话")
+                                .font(.system(size: 11))
+                                .foregroundStyle(StudioPalette.muted)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                        .id(visibleConversationCount)
+                        .onAppear(perform: loadMoreConversations)
+                    }
                 }
-
             }
+        }
+        .onChange(of: conversationQuery) { _, _ in
+            visibleConversationCount = ConversationBatch.size
         }
     }
 
@@ -271,16 +466,20 @@ struct ManagementPane: View {
     private func roleGrid(_ roles: [Role], terminalHome: URL?) -> some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 292), spacing: 13)], alignment: .leading, spacing: 13) {
             if let terminalHome {
-                TerminalRoleCard(home: terminalHome, role: studio.linkedTerminalRole(for: terminalHome), store: studio.store,
+                let terminalRole = studio.linkedTerminalRole(for: terminalHome)
+                TerminalRoleCard(home: terminalHome, role: terminalRole, store: studio.store,
                     open: { studio.withTerminalRole(from: terminalHome, perform: studio.select as (Role) -> Void) },
                     details: { terminalDetails(terminalHome) },
                     edit: { studio.withTerminalRole(from: terminalHome, perform: edit) },
                     editInstructions: { studio.withTerminalRole(from: terminalHome) { editFile($0, .soul) } })
+                    .roleLibraryDragSource(terminalRole?.id)
             }
             ForEach(roles) { role in
                 ManagementRoleCard(role: role, store: studio.store, conversationCount: studio.activeThreads(for: role.id).count,
                     open: { studio.select(role) }, details: { details(role) }, togglePin: { studio.togglePin(role) },
-                    edit: { edit(role) }, editFile: { editFile(role, $0) }, archive: { studio.archiveRole(role) })
+                    edit: { edit(role) }, editFile: { editFile(role, $0) }, archive: { studio.archiveRole(role) },
+                    libraryGroups: libraryGroups, moveToGroup: { studio.moveRole(role.id, to: $0) })
+                    .roleLibraryDragSource(role.id)
             }
         }
     }
@@ -381,7 +580,7 @@ struct WorkspaceConversationRow: View {
         }
         .buttonStyle(StudioRowButton())
         .contextMenu {
-            if thread.id != studio.runningConversation { ConversationOrganizationActions(studio: studio, thread: thread) }
+            if !studio.isGenerating(thread.id) { ConversationOrganizationActions(studio: studio, thread: thread) }
         }
     }
 }

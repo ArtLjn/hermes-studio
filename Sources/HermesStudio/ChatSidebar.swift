@@ -19,6 +19,8 @@ struct ChatSidebar: View {
     @State private var expandedProjects: Set<UUID> = []
     @State private var projectsShowingAll: Set<UUID> = []
     @State private var targetedProject: UUID?
+    @State private var pendingProjectRemoval: StudioProject?
+    @State private var confirmsProjectRemoval = false
     @State private var showsSearch = false
     @State private var query = ""
     @FocusState private var searchFocused: Bool
@@ -99,6 +101,19 @@ struct ChatSidebar: View {
         }
         .frame(maxHeight: .infinity)
         .background(StudioPalette.sidebar.opacity(0.68))
+        .alert("删除项目？", isPresented: $confirmsProjectRemoval, presenting: pendingProjectRemoval) { project in
+            Button("取消", role: .cancel) { pendingProjectRemoval = nil }
+            Button("删除项目", role: .destructive) {
+                if studio.removeProject(project) {
+                    expandedProjects.remove(project.id)
+                    projectsShowingAll.remove(project.id)
+                    if targetedProject == project.id { targetedProject = nil }
+                }
+                pendingProjectRemoval = nil
+            }
+        } message: { project in
+            Text("「\(project.name)」会从项目列表移除，对话会回到普通对话列表，磁盘上的目录和文件会保留。")
+        }
         .onChange(of: studio.roleID) { _, _ in
             projectsVisible = false
             expandedProjects = Set([studio.projectID].compactMap { $0 })
@@ -198,6 +213,7 @@ struct ChatSidebar: View {
                         expandedProjects.insert(project.id)
                         studio.newConversation(in: project)
                     }
+                    StudioIconButton(title: "删除项目", symbol: "trash") { confirmRemoval(of: project) }
                 }
             }
             .accessibilityValue(expanded ? "已展开" : "已折叠")
@@ -207,6 +223,8 @@ struct ChatSidebar: View {
                     studio.newConversation(in: project)
                 }
                 Button("在访达中打开", systemImage: "folder") { studio.openFolder(project) }
+                Divider()
+                Button("删除项目", systemImage: "trash", role: .destructive) { confirmRemoval(of: project) }
             }
             .dropDestination(for: ConversationDrag.self) { items, _ in
                 guard items.count == 1, let item = items.first, item.roleID == studio.roleID else { return false }
@@ -234,6 +252,11 @@ struct ChatSidebar: View {
         }
     }
 
+    private func confirmRemoval(of project: StudioProject) {
+        pendingProjectRemoval = project
+        confirmsProjectRemoval = true
+    }
+
     private func moveThread(_ id: UUID, to project: StudioProject) -> Bool {
         guard studio.moveConversation(id, to: project) else { return false }
         expandedProjects.insert(project.id)
@@ -243,7 +266,7 @@ struct ChatSidebar: View {
     @ViewBuilder
     private func threadRow(_ thread: Conversation, nested: Bool = false) -> some View {
         let selected = studio.conversationID == thread.id
-        let running = thread.id == studio.runningConversation
+        let running = studio.isGenerating(thread.id)
         let destinations = studio.projects.filter { $0.id != thread.projectID }
         let row = SidebarEntry(selected: selected) {
             studio.select(thread)

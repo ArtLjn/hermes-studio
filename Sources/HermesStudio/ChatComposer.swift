@@ -16,6 +16,7 @@ struct ChatComposer: View {
     @State private var dismissedDraft: String?
     @State private var nativeResult: (NativeRequest, [HermesCompletion])?
     @State private var historyResult: (HistoryRequest, String)?
+    @State private var contextReview: ConsultationContextReview?
 
     private enum Token: Equatable {
         case skill(SkillCommand)
@@ -35,7 +36,7 @@ struct ChatComposer: View {
     private var token: Token? {
         guard focused, selection.length == 0 else { return nil }
         if let command = SkillCommand.atCaret(selection.location, in: studio.draft) { return .skill(command) }
-        if studio.project != nil, let reference = HermesCompletion.reference(at: selection.location, in: studio.draft) {
+        if studio.roleID != nil, let reference = HermesCompletion.reference(at: selection.location, in: studio.draft) {
             return .reference(reference.word, reference.range)
         }
         return nil
@@ -59,8 +60,13 @@ struct ChatComposer: View {
     private func choices(for token: Token) -> [ComposerChoice] {
         let matches = nativeResult.flatMap { $0.0 == nativeRequest ? $0.1 : nil } ?? []
         let native = matches.map(ComposerChoice.native)
-        guard case .skill(let command) = token else { return native }
-        return native + HermesSkill.matching(command.query, in: studio.availableSkills).map(ComposerChoice.skill)
+        switch token {
+        case .skill(let command):
+            return native + HermesSkill.matching(command.query, in: studio.availableSkills).map(ComposerChoice.skill)
+        case .reference(let word, _):
+            guard let sourceID = studio.roleID, studio.selectedHandoffTargetID == nil else { return native }
+            return RoleHandoff.candidates(for: word, in: studio.roles, excluding: sourceID).map(ComposerChoice.role) + native
+        }
     }
 
     private var showingInlineCompletion: Bool {
@@ -84,20 +90,11 @@ struct ChatComposer: View {
         let request = nativeRequest
         let history = historyRequest
         VStack(spacing: 8) {
-            if let token = activeToken {
-                CompletionSuggestions(matches: choices(for: token), highlighted: highlighted,
+            if let token = activeToken, request != nil || !choices(for: token).isEmpty || studio.project != nil {
+                CompletionSuggestions(matches: choices(for: token), highlighted: highlighted, store: studio.store,
                     emptyMessage: request != nil && nativeResult?.0 != request ? "正在查找补全…" : "没有匹配的补全") {
                     select($0, for: token)
                 }
-            }
-            if studio.isGeneratingHere, studio.insertingMessage != nil {
-                HStack(spacing: 7) {
-                    ProgressView().controlSize(.mini)
-                    Text("正在插入当前任务")
-                }
-                .font(.system(size: 11))
-                .foregroundStyle(StudioPalette.muted)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
             composer(suggestion: suggestion)
         }
@@ -122,24 +119,33 @@ struct ChatComposer: View {
             historyResult = (history, suffix)
         }
         .onChange(of: studio.draft) { _, _ in dismissedDraft = nil }
+        .sheet(item: $contextReview) { review in
+            ConsultationContextSheet(review: review, store: studio.store) { selected in
+                studio.shareConsultationContext(selected, from: review)
+            }
+        }
     }
 
     private func composer(suggestion: String?) -> some View {
-        VStack(spacing: 6) {
-            if !studio.images.isEmpty || studio.selectedSkill != nil { contextTray }
-            ComposerEditor(text: $studio.draft, focused: $focused, selection: $selection, height: $editorHeight,
-                focusRequest: focusRequest,
-                placeholder: dropping ? "松开以添加图片" : studio.role.map { "发消息给\($0.name)…" } ?? "选择一个角色…",
-                completion: suggestion, handle: handle, pasteImage: studio.pasteClipboardImages)
-                .frame(height: editorHeight)
-            toolbar(suggestion: suggestion)
+        VStack(spacing: 0) {
+            if !studio.queuedMessages.isEmpty {
+                ComposerReplyQueue(studio: studio).id(studio.conversationID)
+                StudioRule()
+            }
+            VStack(spacing: 6) {
+                if !studio.images.isEmpty || studio.selectedSkill != nil || studio.selectedHandoffTargetID != nil { contextTray }
+                ComposerEditor(text: $studio.draft, focused: $focused, selection: $selection, height: $editorHeight,
+                    focusRequest: focusRequest,
+                    placeholder: dropping ? "松开以添加图片" : placeholder,
+                    completion: suggestion, handle: handle, pasteImage: studio.pasteClipboardImages)
+                    .frame(height: editorHeight)
+                toolbar(suggestion: suggestion)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .background {
-            RoundedRectangle(cornerRadius: 11)
-                .fill(StudioPalette.raised.opacity(0.90))
-        }
+        .background(StudioPalette.raised.opacity(0.90))
+        .clipShape(RoundedRectangle(cornerRadius: 11))
         .overlay {
             RoundedRectangle(cornerRadius: 11)
                 .strokeBorder(dropping ? StudioPalette.accent : focused ? StudioPalette.accent.opacity(0.42) : StudioPalette.outline)
@@ -156,6 +162,17 @@ struct ChatComposer: View {
             case .failure(let error): studio.error = error.localizedDescription
             }
         }
+    }
+
+    private var placeholder: String {
+        if studio.selectedHandoffTargetID != nil {
+            switch studio.collaborationMode {
+            case .handoff: return "补充交接任务或需要接手的事项…"
+            case .question: return "输入要发给这位助手的问题…"
+            case .preparedQuestion: return "告诉当前助手你想请教什么…"
+            }
+        }
+        return studio.role.map { "发消息给\($0.name)… 输入 @ 可向其他助手提问或交接" } ?? "选择一个角色…"
     }
 
     private func handle(_ key: ComposerKey) -> Bool {
@@ -220,6 +237,12 @@ struct ChatComposer: View {
         case (.native(let match), .reference(_, let tokenRange)):
             range = tokenRange
             insertion = match.insertion
+        case (.role(let role), .reference(_, let tokenRange)):
+            range = tokenRange
+            insertion = ""
+            studio.selectedHandoffTargetID = role.id
+            studio.collaborationMode = .question
+            studio.clearConsultationContext()
         default:
             return
         }
@@ -231,12 +254,67 @@ struct ChatComposer: View {
     private var contextTray: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 7) {
+                if let targetID = studio.selectedHandoffTargetID {
+                    let target = studio.roles.first { $0.id == targetID }
+                    HStack(spacing: 6) {
+                        if let target {
+                            RolePortrait(role: target, store: studio.store, size: 18)
+                            Text(target.name)
+                            Menu {
+                                ForEach(RoleCollaborationMode.allCases) { mode in
+                                    Button {
+                                        studio.collaborationMode = mode
+                                        if mode != .question { studio.clearConsultationContext() }
+                                    } label: {
+                                        if studio.collaborationMode == mode {
+                                            Label(mode.label, systemImage: "checkmark")
+                                        } else {
+                                            Text(mode.label)
+                                        }
+                                    }
+                                }
+                            } label: {
+                                Text(studio.collaborationMode.label)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .accessibilityLabel("协作方式")
+                            .accessibilityValue(studio.collaborationMode.label)
+                        } else {
+                            Label("接收助手不可用", systemImage: "person.2")
+                        }
+                        Button {
+                            studio.selectedHandoffTargetID = nil
+                            studio.collaborationMode = .question
+                            studio.clearConsultationContext()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("移除协作助手")
+                    }
+                    .padding(8)
+                    .foregroundStyle(StudioPalette.accent)
+                    .background(StudioPalette.selected, in: RoundedRectangle(cornerRadius: 7))
+                }
+                if let review = studio.consultationContextReview() {
+                    let count = studio.sharedConsultationContext.count
+                    Button(count == 0 ? "附带前文" : "已选 \(count) 条前文", systemImage: "quote.bubble") {
+                        contextReview = review
+                    }
+                    .buttonStyle(.plain)
+                    .padding(8)
+                    .foregroundStyle(count == 0 ? StudioPalette.muted : StudioPalette.accent)
+                    .background(StudioPalette.selected, in: RoundedRectangle(cornerRadius: 7))
+                }
                 ForEach(studio.images) { image in
                     ZStack(alignment: .topTrailing) {
                         if let preview = NSImage(data: image.data) {
-                            Image(nsImage: preview).resizable().scaledToFill()
-                                .frame(width: 78, height: 61).clipped()
-                                .clipShape(RoundedRectangle(cornerRadius: 7))
+                            ChatImagePreviewButton(name: image.image.name, image: preview) {
+                                Image(nsImage: preview).resizable().scaledToFill()
+                                    .frame(width: 78, height: 61).clipped()
+                                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                            }
                         }
                         Button { studio.removeImage(image.id) } label: {
                             Image(systemName: "xmark").font(.system(size: 8, weight: .semibold))
@@ -247,7 +325,6 @@ struct ChatComposer: View {
                         .accessibilityLabel("移除图片 \(image.image.name)")
                         .padding(3)
                     }
-                    .help(image.image.name)
                 }
                 if let skill = studio.selectedSkill {
                     HStack(spacing: 6) {
@@ -308,26 +385,196 @@ struct ChatComposer: View {
                     .accessibilityLabel("补全为\(studio.draft + suggestion)")
             }
             ComposerRunSettingsButton(studio: studio)
+            let enqueueing = studio.isGeneratingHere || !studio.queuedMessages.isEmpty
             if studio.isGeneratingHere {
-                actionButton("停止回复", symbol: "stop.fill", action: studio.stop)
-                actionButton("插入当前任务", symbol: "arrow.up", action: studio.send)
-                    .disabled(!studio.canSend)
-                    .help("把文字加入正在执行的任务")
-            } else {
-                actionButton("发送消息", symbol: "arrow.up", action: studio.send)
+                replyControl(studio.isStoppingHere ? "停止中" : "停止", label: "停止回复",
+                    symbol: "stop.fill", help: "停止当前回复", action: studio.stop)
+                    .disabled(studio.isStoppingHere)
+            }
+            if studio.canContinueReply {
+                replyControl("继续", label: "继续回复", symbol: "play.fill",
+                    help: "在当前会话中重试上次中断的请求", action: studio.continueReply)
+            } else if !studio.isGeneratingHere || studio.canSend {
+                let collaboration = studio.selectedHandoffTargetID.map { _ in studio.collaborationMode }
+                let action: String = switch collaboration {
+                case .handoff: "整理交接摘要"
+                case .question: "向助手发送问题"
+                case .preparedQuestion: "请当前助手拟问题"
+                case nil: enqueueing ? "加入待发队列" : "发送消息"
+                }
+                let queueingDraft = enqueueing && studio.canSend && collaboration == nil
+                actionButton(action, symbol: collaboration == nil ? "arrow.up" : "arrow.right",
+                    title: queueingDraft ? "排队" : nil, action: studio.send)
                     .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(!studio.canSend || studio.runningConversation != nil)
-                    .help("回车发送 · Shift＋回车换行")
+                    .disabled(!studio.canSend)
+                    .help(collaboration != nil ? action : enqueueing ? "回车加入队列 · Shift＋回车换行" : "回车发送 · Shift＋回车换行")
             }
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(StudioPalette.muted)
     }
 
-    private func actionButton(_ label: String, symbol: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) { Image(systemName: symbol).frame(width: 31, height: 31) }
+    private func replyControl(_ title: String, label: String, symbol: String, help: String,
+        action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label {
+                Text(title).font(.system(size: 12, weight: .medium))
+            } icon: {
+                Image(systemName: symbol).font(.system(size: 9, weight: .semibold))
+            }
+            .foregroundStyle(StudioPalette.muted)
+            .padding(.horizontal, 9)
+            .frame(height: 31)
+        }
+        .buttonStyle(StudioRowButton())
+        .accessibilityLabel(label)
+        .help(help)
+    }
+
+    private func actionButton(_ label: String, symbol: String, title: String?, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            if let title {
+                HStack(spacing: 5) {
+                    Text(title).font(.system(size: 12, weight: .semibold))
+                    Image(systemName: symbol).font(.system(size: 11, weight: .semibold))
+                }
+                .padding(.horizontal, 9)
+                .frame(height: 31)
+                .fixedSize()
+            } else {
+                Image(systemName: symbol).frame(width: 31, height: 31)
+            }
+        }
             .accessibilityLabel(label)
             .buttonStyle(ComposerActionStyle())
+    }
+}
+
+private struct ComposerReplyQueue: View {
+    @ObservedObject var studio: StudioModel
+    @State private var expanded = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        let messages = studio.queuedMessages
+        VStack(spacing: 0) {
+            header(messages)
+            if expanded {
+                StudioRule()
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(messages) { message in
+                            row(message, isFirst: message.id == messages.first?.id)
+                        }
+                    }
+                }
+                .frame(height: CGFloat(min(messages.count, 4)) * 36)
+            }
+        }
+        .font(.system(size: 11))
+        .foregroundStyle(StudioPalette.muted)
+        .background(.black.opacity(0.12))
+    }
+
+    private func header(_ messages: [StudioModel.QueuedMessage]) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .frame(width: 12)
+                    Text("待发 \(messages.count) 条")
+                        .fontWeight(.semibold)
+                        .foregroundStyle(StudioPalette.ink)
+                        .fixedSize()
+                    if !expanded, let first = messages.first {
+                        Rectangle().fill(StudioPalette.outline).frame(width: 1, height: 12).accessibilityHidden(true)
+                        preview(first)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 6)
+                .frame(height: 28)
+            }
+            .buttonStyle(StudioRowButton())
+            .accessibilityLabel(expanded ? "收起待发消息" : "展开 \(messages.count) 条待发消息")
+            if studio.insertingMessage != nil {
+                HStack(spacing: 5) {
+                    ProgressView().controlSize(.mini)
+                    Text("正在插入")
+                }
+                .fixedSize()
+            } else if studio.isReplyQueuePaused {
+                queueAction("继续队列", symbol: "play.fill", help: "恢复按顺序发送待发消息", action: studio.resumeReplyQueue)
+                    .disabled(studio.isStoppingHere)
+            } else if !expanded && studio.canInsertQueuedMessage {
+                insertButton
+            }
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 34)
+    }
+
+    private func row(_ message: StudioModel.QueuedMessage, isFirst: Bool) -> some View {
+        HStack(spacing: 6) {
+            preview(message)
+                .font(.system(size: 12))
+                .foregroundStyle(StudioPalette.ink)
+            Spacer(minLength: 0)
+            if isFirst && studio.canInsertQueuedMessage { insertButton }
+            if message.id != studio.insertingMessage {
+                StudioIconButton(title: "移除待发消息", symbol: "xmark") {
+                    studio.removeQueuedMessage(message.id)
+                }
+            }
+        }
+        .padding(.leading, 14)
+        .padding(.trailing, 8)
+        .frame(height: 36)
+        .overlay(alignment: .top) {
+            if !isFirst { StudioRule().padding(.horizontal, 14) }
+        }
+    }
+
+    private func preview(_ message: StudioModel.QueuedMessage) -> some View {
+        HStack(spacing: 6) {
+            if let firstImage = message.images.first {
+                if let image = NSImage(data: firstImage.data) {
+                    Image(nsImage: image).resizable().scaledToFill()
+                        .frame(width: 23, height: 20)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: "photo").accessibilityHidden(true)
+                }
+                Text("\(message.images.count) 张图片").fixedSize()
+            }
+            if !message.text.isEmpty {
+                Text(message.text).lineLimit(1).help(message.text)
+            } else if let skill = message.skill {
+                Text(skill.name).lineLimit(1).help(skill.name)
+            }
+        }
+        .lineLimit(1)
+    }
+
+    private var insertButton: some View {
+        queueAction("插入", symbol: "arrow.turn.down.right", help: "把队首文字插入当前任务", action: studio.insertQueuedMessage)
+    }
+
+    private func queueAction(_ title: String, symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: symbol)
+                .font(.system(size: 11, weight: .medium))
+                .padding(.horizontal, 7)
+                .frame(height: 26)
+                .fixedSize()
+        }
+        .foregroundStyle(StudioPalette.accent)
+        .buttonStyle(StudioRowButton())
+        .help(help)
     }
 }
 
@@ -337,8 +584,8 @@ private struct ComposerActionStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.system(size: 14, weight: .semibold))
-            .foregroundStyle(enabled ? StudioPalette.background : StudioPalette.muted)
-            .background(enabled ? StudioPalette.ink : StudioPalette.selected, in: RoundedRectangle(cornerRadius: 7))
+            .foregroundStyle(enabled ? StudioPalette.background : StudioPalette.muted.opacity(0.55))
+            .background(enabled ? StudioPalette.accent : StudioPalette.line, in: RoundedRectangle(cornerRadius: 7))
             .opacity(configuration.isPressed ? 0.75 : 1)
     }
 }
@@ -346,32 +593,40 @@ private struct ComposerActionStyle: ButtonStyle {
 private enum ComposerChoice: Identifiable {
     case skill(HermesSkill)
     case native(HermesCompletion)
+    case role(Role)
 
     var id: String {
         switch self {
         case .skill(let item): "skill:" + item.id
         case .native(let item): "native:" + item.id
+        case .role(let role): "role:" + role.id.uuidString
         }
     }
     var title: String {
         switch self {
         case .skill(let item): item.name
         case .native(let item): item.display
+        case .role(let role): "@" + role.name
         }
     }
     var detail: String {
         switch self {
         case .skill(let item): item.summary
         case .native(let item): item.detail
+        case .role(let role): role.summary.isEmpty ? "与此助手协作" : role.summary
         }
     }
-    var symbol: String {
+    @ViewBuilder
+    func icon(store: RoleStore) -> some View {
         switch self {
-        case .skill: "puzzlepiece.extension"
+        case .role(let role):
+            RolePortrait(role: role, store: store, size: 22)
+        case .skill:
+            Image(systemName: "puzzlepiece.extension")
         case .native(let item):
-            if item.text.hasPrefix("@folder") { "folder" }
-            else if item.text.hasPrefix("@file") { "doc" }
-            else { "terminal" }
+            if item.text.hasPrefix("@folder") { Image(systemName: "folder") }
+            else if item.text.hasPrefix("@file") { Image(systemName: "doc") }
+            else { Image(systemName: "terminal") }
         }
     }
 }
@@ -379,6 +634,7 @@ private enum ComposerChoice: Identifiable {
 private struct CompletionSuggestions: View {
     let matches: [ComposerChoice]
     let highlighted: Int
+    let store: RoleStore
     let emptyMessage: String
     let select: (ComposerChoice) -> Void
 
@@ -424,7 +680,8 @@ private struct CompletionSuggestions: View {
         let selected = match.id == highlightedID
         return Button { select(match) } label: {
             HStack(spacing: 10) {
-                Image(systemName: match.symbol)
+                match.icon(store: store)
+                    .frame(width: 22)
                     .foregroundStyle(StudioPalette.accent)
                     .accessibilityHidden(true)
                 Text(match.title)

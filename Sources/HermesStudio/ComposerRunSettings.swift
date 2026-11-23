@@ -8,15 +8,15 @@ struct ComposerRunSettingsButton: View {
     var body: some View {
         Button { presented.toggle() } label: {
             HStack(spacing: 6) {
-                Image(systemName: "checkmark.shield")
-                Text(studio.runSettings?.editApproval.map { approvalTitle($0.value, fallback: $0.name) } ?? "权限")
+                Image(systemName: studio.composerApprovalMode == .fullAccess ? "exclamationmark.shield" : "checkmark.shield")
+                Text(studio.composerApprovalMode.map(approvalTitle) ?? "权限")
                     .fixedSize()
                 Text("·").accessibilityHidden(true)
                 Text(studio.composerModelName)
                     .lineLimit(1)
-                if let effort = studio.runSettings?.effort {
+                if let effort = studio.composerEffort {
                     Text("·").accessibilityHidden(true)
-                    Text(effortLabel(effort.value)).fixedSize()
+                    Text(effortLabel(effort)).fixedSize()
                 }
                 Image(systemName: "chevron.down").font(.system(size: 8, weight: .semibold))
             }
@@ -26,12 +26,12 @@ struct ComposerRunSettingsButton: View {
         .buttonStyle(StudioRowButton(selected: presented))
         .accessibilityLabel("运行设置")
         .accessibilityValue([
-            studio.runSettings?.editApproval.map { approvalTitle($0.value, fallback: $0.name) },
+            studio.composerApprovalMode.map(approvalTitle),
             studio.composerModelName,
-            studio.runSettings?.effort.map { effortLabel($0.value) }
+            studio.composerEffort.map(effortLabel)
         ].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "，"))
-        .help(studio.runningConversation == nil ? "设置当前对话的权限、模型与推理强度" : "回复结束后可调整运行设置")
-        .disabled(!studio.available || studio.runningConversation != nil)
+        .help(studio.isGeneratingHere ? "回复结束后可调整运行设置" : "设置当前对话的权限、模型与推理强度")
+        .disabled(!studio.available || studio.isGeneratingHere)
         .popover(isPresented: $presented, arrowEdge: .bottom) {
             ComposerRunSettings(studio: studio)
         }
@@ -42,6 +42,7 @@ struct ComposerRunSettingsButton: View {
 private struct ComposerRunSettings: View {
     @ObservedObject var studio: StudioModel
     @State private var choosingModel = false
+    @State private var confirmingFullAccess = false
     @State private var query = ""
 
     var body: some View {
@@ -52,10 +53,21 @@ private struct ComposerRunSettings: View {
                 Spacer()
                 if studio.loadingRunSettings { ProgressView().controlSize(.small) }
             }
+            Text("记住权限、模型和推理强度。模型和推理强度作为新对话默认值。")
+                .font(.system(size: 11))
+                .foregroundStyle(StudioPalette.muted)
             StudioRule()
             if let approval = studio.runSettings?.editApproval, !approval.choices.isEmpty {
                 approvalPicker(approval)
                 if studio.runSettings?.model != nil || studio.runSettings?.effort != nil { StudioRule() }
+            } else if studio.runPreferences.managesTerminalApproval {
+                approvalPicker(nil)
+            }
+            if studio.runPreferences.approval == .fullAccess {
+                Toggle("群聊也使用完全访问", isOn: Binding(
+                    get: { studio.runPreferences.enablesGroupFullAccess },
+                    set: { studio.setGroupFullAccess($0) }))
+                .toggleStyle(.switch).controlSize(.small)
             }
             if let model = studio.runSettings?.model {
                 modelPicker(model)
@@ -67,7 +79,7 @@ private struct ComposerRunSettings: View {
                 HStack {
                     Text(error).foregroundStyle(StudioPalette.muted)
                     Spacer()
-                    Button("重试") { Task { await studio.updateRunSettings() } }
+                    Button("重试") { Task { await studio.updateRunSettings(includeModelChoices: choosingModel) } }
                         .buttonStyle(QuietButton())
                 }
             } else if studio.runSettings == nil {
@@ -83,23 +95,37 @@ private struct ComposerRunSettings: View {
         .task { await studio.updateRunSettings() }
     }
 
-    private func approvalPicker(_ selection: HermesRunSettings.Selection) -> some View {
+    private func approvalPicker(_ selection: HermesRunSettings.Selection?) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("编辑权限").foregroundStyle(StudioPalette.muted)
-            ForEach(selection.choices) { choice in
-                let selected = choice.id == selection.value
+            HStack {
+                Text("运行权限").foregroundStyle(StudioPalette.muted)
+                Spacer(minLength: 6)
+                Text(studio.project?.name ?? "角色工作区")
+                    .font(.system(size: 11))
+                    .foregroundStyle(StudioPalette.muted)
+                    .lineLimit(1)
+            }
+            let modes = Set(selection?.choices.compactMap { HermesApprovalMode(nativeID: $0.id) } ?? [.manual, .workspace])
+            ForEach(HermesApprovalMode.allCases.filter {
+                modes.contains($0) || ($0 == .fullAccess &&
+                    (modes.contains(.editWithoutApproval) || studio.composerApprovalMode == .fullAccess))
+            }, id: \.self) { mode in
+                let selected = mode == studio.composerApprovalMode
                 Button {
-                    choose(.editApproval, choice.id, current: selection.value)
+                    if mode == .fullAccess && !selected {
+                        confirmingFullAccess = true
+                    } else {
+                        confirmingFullAccess = false
+                        Task { await studio.updateRunSettings(approval: mode) }
+                    }
                 } label: {
                     HStack(spacing: 8) {
                         VStack(alignment: .leading, spacing: 3) {
-                            Text(approvalTitle(choice.id, fallback: choice.name))
+                            Text(approvalTitle(mode))
                                 .fontWeight(.medium)
-                            if let description = approvalDescription(choice.id) {
-                                Text(description)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(StudioPalette.muted)
-                            }
+                            Text(approvalDescription(mode))
+                                .font(.system(size: 11))
+                                .foregroundStyle(StudioPalette.muted)
                         }
                         Spacer(minLength: 4)
                         if selected { Image(systemName: "checkmark") }
@@ -109,6 +135,24 @@ private struct ComposerRunSettings: View {
                 }
                 .buttonStyle(StudioRowButton(selected: selected))
                 .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+            if confirmingFullAccess {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("开启后，所有对话后续发送都会沿用完全访问，直到你切换权限。")
+                        .font(.system(size: 11))
+                        .foregroundStyle(StudioPalette.muted)
+                    HStack {
+                        Spacer()
+                        Button("取消") { confirmingFullAccess = false }
+                            .buttonStyle(QuietButton())
+                        StudioPrimaryButton(title: "启用并记住", symbol: "checkmark") {
+                            confirmingFullAccess = false
+                            Task { await studio.updateRunSettings(approval: .fullAccess) }
+                        }
+                    }
+                }
+                .padding(8)
+                .background(StudioPalette.raised, in: RoundedRectangle(cornerRadius: 6))
             }
         }
         .disabled(studio.loadingRunSettings)
@@ -120,6 +164,7 @@ private struct ComposerRunSettings: View {
             Button {
                 choosingModel.toggle()
                 query = ""
+                if choosingModel { Task { await studio.updateRunSettings(includeModelChoices: true) } }
             } label: {
                 HStack {
                     Text(selection.name).lineLimit(1)
@@ -141,15 +186,17 @@ private struct ComposerRunSettings: View {
                     search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)
                         || $0.id.localizedCaseInsensitiveContains(search)
                 }
-                if matches.isEmpty {
+                if studio.loadingRunSettings {
+                    Text("正在读取模型列表…").foregroundStyle(StudioPalette.muted)
+                } else if matches.isEmpty && studio.runSettingsError == nil {
                     Text("没有匹配的模型").foregroundStyle(StudioPalette.muted)
-                } else {
+                } else if !matches.isEmpty {
                     ScrollView {
                         LazyVStack(spacing: 2) {
                             ForEach(matches) { choice in
                                 Button {
                                     choosingModel = false
-                                    choose(.model, choice.id, current: selection.value)
+                                    choose(.model, choice.id)
                                 } label: {
                                     HStack {
                                         Text(choice.name).lineLimit(1)
@@ -178,7 +225,7 @@ private struct ComposerRunSettings: View {
             Menu {
                 ForEach(selection.choices) { choice in
                     Button {
-                        choose(.effort, choice.id, current: selection.value)
+                        choose(.effort, choice.id)
                     } label: {
                         if choice.id == selection.value {
                             Label(effortLabel(choice.id), systemImage: "checkmark")
@@ -198,27 +245,26 @@ private struct ComposerRunSettings: View {
         .disabled(studio.loadingRunSettings)
     }
 
-    private func choose(_ field: HermesRunSettings.Field, _ value: String, current: String) {
-        guard current != value else { return }
+    private func choose(_ field: HermesRunSettings.Field, _ value: String) {
         Task { await studio.updateRunSettings(field: field, value: value) }
     }
 }
 
-private func approvalTitle(_ value: String, fallback: String) -> String {
+private func approvalTitle(_ value: HermesApprovalMode) -> String {
     switch value {
-    case "ask", "default": "手动"
-    case "workspace_session", "accept_edits": "自动"
-    case "session", "dont_ask": "编辑免审批"
-    default: fallback
+    case .manual: "手动"
+    case .workspace: "工作区自动"
+    case .editWithoutApproval: "编辑免审批"
+    case .fullAccess: "完全访问"
     }
 }
 
-private func approvalDescription(_ value: String) -> String? {
+private func approvalDescription(_ value: HermesApprovalMode) -> String {
     switch value {
-    case "ask", "default": "每次文件编辑都询问"
-    case "workspace_session", "accept_edits": "自动允许工作区和临时目录的普通编辑"
-    case "session", "dont_ask": "自动允许本对话的普通编辑，敏感路径仍会询问"
-    default: nil
+    case .manual: "每次文件编辑都询问"
+    case .workspace: "工作区和 Hermes 临时目录内的普通编辑自动放行"
+    case .editWithoutApproval: "普通编辑自动放行，包括工作区外的文件"
+    case .fullAccess: "普通编辑和终端命令免审批，敏感文件与系统权限仍受保护"
     }
 }
 

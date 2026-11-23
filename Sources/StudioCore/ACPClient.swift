@@ -23,6 +23,10 @@ public final class TurnControl: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
     private var process: Process?
+    private var cancelPrompt: (() throws -> Void)?
+    private var promptStarted = false
+    private var cancelledBeforePrompt: (() -> Void)?
+    private var cancellationDeadline: DispatchTime?
     private var submitFollowUp: ((UUID, String) throws -> Void)?
     private var acceptsFollowUps = false
     private var followUp: (id: UUID, text: String, started: Bool, acknowledged: Bool)?
@@ -32,11 +36,56 @@ public final class TurnControl: @unchecked Sendable {
     public init() {}
 
     public func cancel() {
-        lock.lock()
-        cancelled = true
-        if let process, process.isRunning { process.terminate() }
-        lock.unlock()
+        let action = lock.withLock { () -> (Process?, (() throws -> Void)?, (() -> Void)?)? in
+            guard !cancelled else { return nil }
+            cancelled = true
+            cancellationDeadline = .now() + .seconds(5)
+            let action = (process, cancelPrompt, cancelledBeforePrompt)
+            cancelledBeforePrompt = nil
+            return action
+        }
+        guard let (process, notifyHermes, beforePrompt) = action else { return }
+        beforePrompt?()
+        guard let process else { return }
+        let queue = DispatchQueue.global(qos: .userInitiated)
+        if let notifyHermes {
+            // Hermes 在登记会话请求前可能忽略第一次通知。只对当前连接重试。
+            for delay in [0, 250, 1_000, 2_500] {
+                queue.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+                    guard self?.isAttached(to: process) == true else { return }
+                    try? notifyHermes()
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + (notifyHermes == nil ? .milliseconds(0) : .seconds(5))) { [weak self] in
+            if self?.isAttached(to: process) == true, process.isRunning {
+                process.terminate()
+            }
+        }
     }
+
+    private func isAttached(to process: Process) -> Bool { lock.withLock { self.process === process } }
+
+    fileprivate func onCancellationBeforePrompt(_ handler: @escaping () -> Void) {
+        let shouldNotify = lock.withLock {
+            if cancelled { return !promptStarted }
+            cancelledBeforePrompt = handler
+            return false
+        }
+        if shouldNotify { handler() }
+    }
+
+    fileprivate func startPrompt(cancel: @escaping () throws -> Void) throws {
+        try lock.withLock {
+            if cancelled { throw CancellationError() }
+            promptStarted = true
+            cancelledBeforePrompt = nil
+            cancelPrompt = cancel
+        }
+    }
+
+    fileprivate var awaitingStopConfirmation: Bool { lock.withLock { cancelled && promptStarted } }
+    fileprivate var stopDeadline: DispatchTime? { lock.withLock { cancellationDeadline } }
 
     public func enqueueFollowUp(id: UUID, text: String) -> Bool {
         lock.withLock {
@@ -136,6 +185,8 @@ public final class TurnControl: @unchecked Sendable {
     fileprivate func detach() {
         lock.withLock {
             process = nil
+            cancelPrompt = nil
+            cancelledBeforePrompt = nil
             submitFollowUp = nil
             acceptsFollowUps = false
             followUp = nil
@@ -144,7 +195,7 @@ public final class TurnControl: @unchecked Sendable {
         }
     }
 
-    var isCancelled: Bool {
+    public var isCancelled: Bool {
         lock.lock()
         defer { lock.unlock() }
         return cancelled
@@ -153,42 +204,95 @@ public final class TurnControl: @unchecked Sendable {
 
 extension HermesRuntime {
     public func warm(home: URL, conversation: Conversation?, workspace: URL? = nil, skillIDs: Set<String>? = nil,
+        mcpServers: [MCPServer.Connection] = [],
         onSettings: (@Sendable (String, HermesRunSettings) -> Void)? = nil) {
-        workers.queue.async {
-            do {
-                let worker = try workers.connection(runtime: self, home: home, skillIDs: skillIDs,
-                    projectTools: workspace != nil)
-                if let id = conversation?.sessionID {
-                    let directory = try self.sessionDirectory(home: home, workspace: workspace)
-                    _ = try worker.session(existing: id, workspace: directory)
-                    if let settings = worker.rpc.settings[id] { onSettings?(id, settings) }
+        let id = conversation?.sessionID
+        workers.perform(runtime: self, home: home, sessionID: id, skillIDs: skillIDs,
+            workspace: workspace, mcpServers: mcpServers, prewarmOnly: id == nil) { worker, _ in
+            if let id {
+                if let settings = worker.rpc.settings[id] { onSettings?(id, settings) }
+            }
+        } completion: { _ in }
+    }
+
+    public func reset(home: URL) {
+        workers.reset(home: home)
+    }
+
+    public func releaseIdleWorkers() async {
+        await withCheckedContinuation { continuation in
+            workers.releaseIdle { continuation.resume() }
+        }
+    }
+
+    public func keepGroupWarm(homes: Set<URL>, idleLimit: Int = 6) {
+        workers.keepWarm(homes: homes, idleLimit: idleLimit)
+    }
+
+    public func warmGroupSpeaker(home: URL) {
+        workers.perform(runtime: self, home: home, sessionID: nil, skillIDs: [], draft: true,
+            reuseDraftWorker: true, workspace: nil, mcpServers: [], prewarmOnly: true, withVision: true,
+            sessionMCPServers: [], budget: .chat, speculativeGroupWarm: true) { _, _ in
+        } completion: { _ in }
+    }
+
+    private func applyRunPreferences(_ preferences: HermesRunPreferences, useModelDefaults: Bool,
+        worker: ACPWorker, sessionID: String, home: URL) throws {
+        if useModelDefaults {
+            if let value = preferences.modelID, let model = worker.rpc.settings[sessionID]?.model, model.value != value {
+                if model.choices.contains(where: { $0.id == value }) {
+                    try worker.setRunSetting(.model, value: value, sessionID: sessionID)
+                } else if worker.hasDeferredModelCatalog {
+                    // 已保存的选项由 Hermes 单独验证，失效的默认值沿用会话当前模型。
+                    try? worker.setRunSetting(.model, value: value, sessionID: sessionID, applyingSavedModel: true)
                 }
-                workers.keepWarm(home: home)
+            }
+            if let value = preferences.effort, let effort = worker.rpc.settings[sessionID]?.effort,
+                effort.value != value, effort.choices.contains(where: { $0.id == value }) {
+                try worker.setRunSetting(.effort, value: value, sessionID: sessionID)
+            }
+        }
+        let enableYOLO = preferences.approval == .fullAccess
+        if preferences.managesTerminalApproval && !enableYOLO {
+            try setTerminalApprovalBypass(false, sessionID: sessionID, home: home)
+        }
+        guard let mode = preferences.approval else { return }
+        let editApproval = worker.rpc.settings[sessionID]?.editApproval
+        guard let choice = mode.nativeChoice(in: editApproval) else {
+            throw StudioError.message("当前 Hermes 不支持所选文件权限，请重新选择运行权限。")
+        }
+        if choice.id != editApproval?.value {
+            try worker.setRunSetting(.editApproval, value: choice.id, sessionID: sessionID)
+        }
+        if enableYOLO {
+            do {
+                try setTerminalApprovalBypass(true, sessionID: sessionID, home: home)
             } catch {
-                workers.remove(home: home)
+                if let previous = editApproval?.value, previous != choice.id {
+                    try? worker.setRunSetting(.editApproval, value: previous, sessionID: sessionID)
+                }
+                throw error
             }
         }
     }
 
-    public func reset(home: URL) {
-        workers.queue.async { workers.remove(home: home) }
-    }
-
     public func runSettings(home: URL, sessionID: String?, workspace: URL? = nil, skillIDs: Set<String>? = nil,
-        change: (field: HermesRunSettings.Field, value: String)? = nil) async throws -> HermesRunSession {
+        mcpServers: [MCPServer.Connection] = [],
+        preferences: HermesRunPreferences = .init(), useModelDefaults: Bool = false,
+        change: (field: HermesRunSettings.Field, value: String)? = nil,
+        includeModelChoices: Bool = true) async throws -> HermesRunSession {
         try await withCheckedThrowingContinuation { continuation in
-            workers.queue.async {
-                do {
-                    let directory = try sessionDirectory(home: home, workspace: workspace)
-                    let worker = try workers.connection(runtime: self, home: home, skillIDs: skillIDs,
-                        projectTools: workspace != nil)
-                    let id = try worker.session(existing: sessionID, workspace: directory)
-                    workers.keepWarm(home: home)
-                    if let change { try worker.setRunSetting(change.field, value: change.value, sessionID: id) }
-                    continuation.resume(returning: HermesRunSession(id: id, settings: worker.rpc.settings[id]))
-                } catch {
-                    continuation.resume(throwing: error)
+            workers.perform(runtime: self, home: home, sessionID: sessionID, skillIDs: skillIDs,
+                workspace: workspace, mcpServers: mcpServers) { worker, id in
+                try applyRunPreferences(preferences, useModelDefaults: useModelDefaults, worker: worker,
+                    sessionID: id, home: home)
+                if includeModelChoices || change.map({ $0.field == .model }) == true {
+                    try worker.loadModelChoices(sessionID: id)
                 }
+                if let change { try worker.setRunSetting(change.field, value: change.value, sessionID: id) }
+                return HermesRunSession(id: id, settings: worker.rpc.settings[id])
+            } completion: { result in
+                continuation.resume(with: result)
             }
         }
     }
@@ -196,57 +300,78 @@ extension HermesRuntime {
     public func turn(
         home: URL, conversation: Conversation, text: String, images: [ImagePayload] = [],
         skill: HermesSkill? = nil, workspace: URL? = nil, skillIDs: Set<String>? = nil,
-        interactive: Bool = false, control: TurnControl
+        mcpServers: [MCPServer.Connection] = [], preferences: HermesRunPreferences = .init(),
+        useModelDefaults: Bool = false, interactive: Bool = false, control: TurnControl
     ) -> AsyncStream<TurnEvent> {
         streamTurn(home: home, conversation: conversation, text: text, images: images, skill: skill,
-            workspace: workspace, skillIDs: skillIDs, draft: false, interactive: interactive, control: control)
+            workspace: workspace, skillIDs: skillIDs, mcpServers: mcpServers, draft: false,
+            preferences: preferences, useModelDefaults: useModelDefaults, interactive: interactive, control: control)
+    }
+
+    public func groupRecall(home: URL, roleID: UUID, prompt: String, model: String?, effort: String?,
+        control: TurnControl) -> AsyncStream<TurnEvent> {
+        var preferences = HermesRunPreferences()
+        preferences.modelID = model
+        preferences.effort = effort
+        return streamTurn(home: home, conversation: Conversation(roleID: roleID), text: prompt,
+            skillIDs: [], draft: true, reuseDraftWorker: true, preferences: preferences, useModelDefaults: true, control: control)
     }
 
     func streamTurn(
         home: URL, conversation: Conversation, text: String, images: [ImagePayload] = [],
         skill: HermesSkill? = nil, workspace: URL? = nil, skillIDs: Set<String>? = nil,
-        draft: Bool, interactive: Bool = false, control: TurnControl
+        mcpServers: [MCPServer.Connection] = [], draft: Bool, reuseDraftWorker: Bool = false, preferences: HermesRunPreferences = .init(),
+        useModelDefaults: Bool = false, interactive: Bool = false, groupStart: GroupReplyStart? = nil,
+        toolsets: [String]? = nil, prepareVision: Bool = false,
+        sessionMCPServers: [MCPServer.Connection]? = nil, budget: HermesGenerationBudget? = nil,
+        temporaryRoot: URL? = nil, control: TurnControl
     ) -> AsyncStream<TurnEvent> {
         AsyncStream { stream in
             stream.onTermination = { reason in
                 if case .cancelled = reason { control.cancel() }
             }
-            workers.queue.async {
+            control.onCancellationBeforePrompt {
+                groupStart?.release()
+                stream.yield(.finished("cancelled"))
+                stream.finish()
+            }
+            workers.perform(runtime: self, home: home, sessionID: conversation.sessionID, skillIDs: skillIDs,
+                draft: draft, reuseDraftWorker: reuseDraftWorker, workspace: workspace, mcpServers: mcpServers,
+                withVision: draft && (!images.isEmpty || prepareVision), toolsets: toolsets,
+                sessionMCPServers: sessionMCPServers, budget: budget, temporaryRoot: temporaryRoot, control: control,
+                onActivity: { stream.yield(.activity($0)) }) { worker, sessionID in
+                if conversation.sessionID == nil { stream.yield(.session(sessionID)) }
+                return try runTurn(worker: worker, home: home, sessionID: sessionID, text: text,
+                    images: images, skill: skill, skillIDs: skillIDs,
+                    preferences: preferences, useModelDefaults: useModelDefaults, interactive: interactive,
+                    groupStart: groupStart, control: control) {
+                    stream.yield($0)
+                }
+            } completion: { result in
+                groupStart?.release()
                 defer { stream.finish() }
-                do {
-                    if control.isCancelled { throw CancellationError() }
-                    let result = try runTurn(home: home, conversation: conversation, text: text,
-                        images: images, skill: skill, workspace: workspace, skillIDs: skillIDs,
-                        draft: draft, interactive: interactive, control: control) {
-                        stream.yield($0)
-                    }
-                    if draft || control.isCancelled { workers.remove(home: home) } else { workers.keepWarm(home: home) }
-                    stream.yield(.finished(control.isCancelled ? "cancelled" : result))
-                } catch {
-                    if !(error is CancellationError) { workers.remove(home: home) }
-                    if control.isCancelled {
-                        stream.yield(.finished("cancelled"))
-                    } else {
-                        stream.yield(.failed(error.localizedDescription))
-                    }
+                switch result {
+                case .success(let reason): stream.yield(.finished(reason))
+                case .failure where control.awaitingStopConfirmation:
+                    stream.yield(.failed("Hermes 尚未确认本次任务停止，已关闭本地回复连接。"))
+                case .failure where control.isCancelled:
+                    stream.yield(.finished("cancelled"))
+                case .failure(let error): stream.yield(.failed(error.localizedDescription))
                 }
             }
         }
     }
 
     private func runTurn(
-        home: URL, conversation: Conversation, text: String, images: [ImagePayload],
-        skill: HermesSkill?, workspace requestedWorkspace: URL?, skillIDs: Set<String>?, draft: Bool, interactive: Bool,
-        control: TurnControl, receive: @escaping (TurnEvent) -> Void
+        worker: ACPWorker, home: URL, sessionID: String, text: String, images: [ImagePayload],
+        skill: HermesSkill?, skillIDs: Set<String>?,
+        preferences: HermesRunPreferences,
+        useModelDefaults: Bool, interactive: Bool, groupStart: GroupReplyStart?, control: TurnControl,
+        receive: @escaping (TurnEvent) -> Void
     ) throws -> String {
-        let workspace = try sessionDirectory(home: home, workspace: requestedWorkspace)
-        let worker = try workers.connection(runtime: self, home: home, skillIDs: skillIDs, draft: draft,
-            projectTools: requestedWorkspace != nil, onLaunch: { receive(.activity("正在启动 Hermes")) },
-            control: control)
-        try control.attach(worker.process)
-        defer { control.detach() }
-        let sessionID = try worker.session(existing: conversation.sessionID, workspace: workspace)
-        if conversation.sessionID == nil { receive(.session(sessionID)) }
+        try applyRunPreferences(preferences, useModelDefaults: useModelDefaults, worker: worker,
+            sessionID: sessionID, home: home)
+        if control.isCancelled { throw CancellationError() }
         if interactive, let settings = worker.rpc.settings[sessionID] { receive(.runSettings(settings)) }
         if interactive {
             control.handleInsertion { id, text in
@@ -272,14 +397,20 @@ extension HermesRuntime {
             ["type": "image", "mimeType": $0.image.mimeType, "data": $0.data.base64EncodedString()]
         })
         if control.isCancelled { throw CancellationError() }
+        if let groupStart {
+            receive(.activity("等待同伴就绪"))
+            groupStart.arrive()
+            if control.isCancelled { throw CancellationError() }
+        }
         receive(.activity("等待模型回复"))
         let response = try worker.rpc.call("session/prompt", parameters: [
             "sessionId": sessionID,
             "prompt": prompt
-        ], control: interactive ? control : nil, onPermission: { receive(.permission($0)) },
+        ], control: interactive ? control : nil, cancellation: control, onPermission: { receive(.permission($0)) },
             onFollowUpReady: { receive(.followUpReady) },
             onFollowUpStarted: { receive(.followUpStarted($0)) },
             onFollowUpRejected: { receive(.followUpRejected($0)) }) { update in
+            guard !control.isCancelled else { return }
             let kind = update["sessionUpdate"] as? String
             if kind == "agent_message_chunk",
                 let content = update["content"] as? [String: Any], let text = content["text"] as? String {
@@ -308,7 +439,7 @@ extension HermesRuntime {
         return response["stopReason"] as? String ?? "end_turn"
     }
 
-    private func sessionDirectory(home: URL, workspace: URL?) throws -> URL {
+    fileprivate func sessionDirectory(home: URL, workspace: URL?) throws -> URL {
         let directory = workspace ?? home.appendingPathComponent("workspace", isDirectory: true)
         guard (try? directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else {
             throw StudioError.message("项目目录已移动或不可访问。")
@@ -331,76 +462,401 @@ extension HermesRuntime {
 }
 
 final class ACPWorkerPool: @unchecked Sendable {
-    let queue = DispatchQueue(label: "studio.hermes.acp", qos: .userInitiated)
-    private var workers: [URL: ACPWorker] = [:]
+    private struct SessionKey: Hashable {
+        let home: URL
+        let id: String
+    }
 
-    fileprivate func connection(
-        runtime: HermesRuntime, home: URL, skillIDs: Set<String>?, draft: Bool = false, projectTools: Bool,
-        onLaunch: () -> Void = {}, control: TurnControl? = nil
+    fileprivate struct Options: Equatable {
+        let skillIDs: Set<String>?
+        let draft: Bool
+        let reuseDraftWorker: Bool
+        let mcpServers: [MCPServer.Connection]
+        let proxyRange: String?
+        let withVision: Bool
+        let toolsets: [String]?
+        let sessionScopedMCP: Bool
+        let budget: HermesGenerationBudget?
+    }
+
+    private struct SetupLane {
+        let queue = DispatchQueue(label: "studio.hermes.acp.profile", qos: .userInitiated)
+        var pending = 0
+    }
+
+    private let queue = DispatchQueue(label: "studio.hermes.acp.pool", qos: .userInitiated)
+    private struct IdleEntry {
+        let home: URL
+        let worker: ACPWorker
+        let since: ContinuousClock.Instant
+        let speculative: Bool
+    }
+    private var idle: [IdleEntry] = []
+    private var expiry: Task<Void, Never>?
+    private var generations: [URL: UUID] = [:]
+    private var profileOptions: [URL: Options] = [:]
+    private var waiting: [SessionKey: [() -> Void]] = [:]
+    private var setupLanes: [URL: SetupLane] = [:]
+    private var inUse: [URL: Int] = [:]
+    private let idleTimeout: TimeInterval
+    private let idleCapacity: Int
+    private var preferredHomes: Set<URL> = []
+    private var preferredIdleLimit = 6
+    private var prewarming = false
+    private var prewarmEpoch = UUID()
+    private var effectiveIdleCapacity: Int { max(idleCapacity, min(6, preferredIdleLimit, preferredHomes.count)) }
+
+    init(idleTimeout: TimeInterval = 120, idleCapacity: Int = 2) {
+        self.idleTimeout = idleTimeout
+        self.idleCapacity = max(0, idleCapacity)
+    }
+
+    fileprivate func perform<Value>(
+        runtime: HermesRuntime, home: URL, sessionID: String?, skillIDs: Set<String>?,
+        draft: Bool = false, reuseDraftWorker: Bool = false, workspace: URL?, mcpServers: [MCPServer.Connection],
+        prewarmOnly: Bool = false, withVision: Bool = false, toolsets: [String]? = nil,
+        sessionMCPServers: [MCPServer.Connection]? = nil, budget: HermesGenerationBudget? = nil, temporaryRoot: URL? = nil,
+        control: TurnControl? = nil, speculativeGroupWarm: Bool = false, onActivity: @escaping (String) -> Void = { _ in },
+        work: @escaping (ACPWorker, String) throws -> Value, completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        queue.async {
+            guard !HermesProcessLifetime.shared.isClosing else {
+                if let temporaryRoot { try? FileManager.default.removeItem(at: temporaryRoot) }
+                completion(.failure(CancellationError()))
+                return
+            }
+            let key = sessionID.map { SessionKey(home: home, id: $0) }
+            let options = Options(skillIDs: skillIDs, draft: draft, reuseDraftWorker: reuseDraftWorker, mcpServers: mcpServers,
+                proxyRange: draft ? nil : HermesProxyDNS.activeRange, withVision: withVision, toolsets: toolsets,
+                sessionScopedMCP: sessionMCPServers != nil, budget: budget)
+            let warmEpoch = self.prewarmEpoch
+            if speculativeGroupWarm {
+                guard self.admitsPrewarm(home: home, options: options) else {
+                    completion(.failure(CancellationError()))
+                    return
+                }
+                self.prewarming = true
+            }
+            self.inUse[home, default: 0] += 1
+            let start = {
+                self.setup(home: home) {
+                    var acquired: ACPWorker?
+                    do {
+                        if control?.isCancelled == true { throw CancellationError() }
+                        if speculativeGroupWarm, self.queue.sync(execute: { self.prewarmEpoch != warmEpoch }) {
+                            throw CancellationError()
+                        }
+                        let generation = self.queue.sync { self.generations[home] }
+                        let directory = try runtime.sessionDirectory(home: home, workspace: workspace)
+                        let worker = try self.checkout(runtime: runtime, home: home, sessionID: sessionID,
+                            options: options, generation: generation, onActivity: onActivity, control: control)
+                        acquired = worker
+                        try control?.attach(worker.process)
+                        // 同一角色目录串行准备，独立角色目录可同时启动和载入会话。
+                        if !prewarmOnly { onActivity("正在准备 Hermes 会话") }
+                        let id = prewarmOnly ? "" : try worker.session(existing: sessionID, workspace: directory,
+                            mcpServers: sessionMCPServers ?? [])
+                        let finish = { (result: Result<Value, Error>) in
+                            self.inUse[home, default: 1] -= 1
+                            if speculativeGroupWarm { self.prewarming = false }
+                            let canRetain = !speculativeGroupWarm || (self.prewarmEpoch == warmEpoch
+                                && self.idle.count < self.effectiveIdleCapacity)
+                            if case .success = result, temporaryRoot == nil, !draft || reuseDraftWorker, control?.isCancelled != true,
+                                self.generations[home] == generation, worker.process.isRunning,
+                                canRetain, !HermesProcessLifetime.shared.isClosing {
+                                self.recycle(worker, home: home, speculative: speculativeGroupWarm)
+                            } else {
+                                worker.close()
+                                if temporaryRoot == nil { self.retireIfUnused(home: home) }
+                            }
+                            self.advance(key)
+                        }
+                        if prewarmOnly {
+                            let result = Result { try work(worker, id) }
+                            self.queue.sync { finish(result) }
+                            completion(result)
+                        } else {
+                            // 每个会话独占连接的读取方，流式读取无需占用准备队列。
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let result = Result { try work(worker, id) }
+                                control?.detach()
+                                if let temporaryRoot {
+                                    self.queue.sync { finish(result) }
+                                    HermesProcessLifetime.shared.finishTemporary(home: home, root: temporaryRoot)
+                                } else {
+                                    self.queue.async { finish(result) }
+                                }
+                                completion(result)
+                            }
+                        }
+                    } catch {
+                        acquired?.close()
+                        control?.detach()
+                        self.queue.async {
+                            self.inUse[home, default: 1] -= 1
+                            if speculativeGroupWarm { self.prewarming = false }
+                            if temporaryRoot == nil { self.retireIfUnused(home: home) }
+                            self.advance(key)
+                        }
+                        if let temporaryRoot { HermesProcessLifetime.shared.finishTemporary(home: home, root: temporaryRoot) }
+                        completion(.failure(error))
+                    }
+                }
+            }
+            if let key {
+                if self.waiting[key] != nil {
+                    self.waiting[key]?.append(start)
+                    return
+                }
+                self.waiting[key] = []
+            }
+            start()
+        }
+    }
+
+    private func admitsPrewarm(home: URL, options: Options) -> Bool {
+        expireIdle()
+        return idleCapacity > 0 && preferredHomes.contains(home) && !prewarming
+            && inUse[home, default: 0] == 0 && idle.count < effectiveIdleCapacity
+            && !idle.contains { $0.speculative || ($0.home == home && $0.worker.options == options && $0.worker.process.isRunning) }
+    }
+
+    private func setup(home: URL, work: @escaping () -> Void) {
+        var lane = setupLanes[home] ?? SetupLane()
+        lane.pending += 1
+        setupLanes[home] = lane
+        lane.queue.async {
+            work()
+            self.queue.async {
+                self.setupLanes[home]?.pending -= 1
+                if self.setupLanes[home]?.pending == 0 { self.setupLanes[home] = nil }
+            }
+        }
+    }
+
+    private func advance(_ key: SessionKey?) {
+        guard let key else { return }
+        if let next = waiting[key]?.first {
+            waiting[key]?.removeFirst()
+            // 让其他会话的连接请求也有机会先进入队列。
+            queue.async { next() }
+        } else {
+            waiting[key] = nil
+        }
+    }
+
+    private func checkout(
+        runtime: HermesRuntime, home: URL, sessionID: String?, options: Options, generation: UUID?,
+        onActivity: (String) -> Void, control: TurnControl?
     ) throws -> ACPWorker {
-        if let worker = workers[home], worker.process.isRunning, worker.skillIDs == skillIDs,
-            worker.draft == draft, worker.projectTools == projectTools {
-            return worker
+        let (worker, prepared) = queue.sync { (takeIdleWorker(home: home, sessionID: sessionID, options: options), profileOptions[home]) }
+        if let worker {
+            do {
+                if prepared != options { _ = try prepare(runtime, home: home, options: options, generation: generation) }
+                return worker
+            } catch {
+                worker.close()
+                throw error
+            }
         }
-        remove(home: home)
-        if workers.count >= 2, let oldest = workers.min(by: { $0.value.lastUse < $1.value.lastUse })?.key {
-            remove(home: oldest)
-        }
-        onLaunch()
-        let env = try runtime.prepare(home: home, withVision: !draft, skillIDs: skillIDs, draft: draft,
-            projectTools: projectTools)
+        onActivity("正在准备 Hermes 配置")
+        let env = try prepare(runtime, home: home, options: options, generation: generation)
         if control?.isCancelled == true { throw CancellationError() }
+        onActivity("正在启动 Hermes")
         let process = runtime.process(arguments: ["acp"], directory: home.appendingPathComponent("workspace"), overrides: env)
-        let worker = try ACPWorker(process: process, skillIDs: skillIDs, draft: draft,
-            projectTools: projectTools, control: control)
-        workers[home] = worker
-        return worker
-    }
-
-    fileprivate func keepWarm(home: URL) {
-        guard let worker = workers[home] else { return }
-        let timestamp = DispatchTime.now().uptimeNanoseconds
-        worker.lastUse = timestamp
-        queue.asyncAfter(deadline: .now() + 180) { [weak self] in
-            guard let self, self.workers[home]?.lastUse == timestamp else { return }
-            self.remove(home: home)
+        let refreshMCP: ((String) throws -> Void)?
+        if (!options.draft || !options.mcpServers.isEmpty), runtime.usesStudioMCP(home: home) {
+            refreshMCP = { [executable = runtime.executable] id in
+                // 保留当前网关的会话与权限记录，由 Hermes 刷新它实际使用的 MCP 清单。
+                try HermesRuntime(executable: executable)
+                    .refreshMCP(sessionID: id, home: home, serverNames: options.mcpServers.map(\.name))
+            }
+        } else {
+            refreshMCP = nil
+        }
+        let customized = runtime.acpLauncher.configure(process, runtime: runtime)
+        do {
+            return try ACPWorker(process: process, home: home, options: options, refreshMCP: refreshMCP, control: control)
+        } catch where customized && control?.isCancelled != true && !HermesProcessLifetime.shared.isClosing {
+            runtime.acpLauncher.useNative()
+            let native = runtime.process(arguments: ["acp"], directory: home.appendingPathComponent("workspace"), overrides: env)
+            return try ACPWorker(process: native, home: home, options: options, refreshMCP: refreshMCP, control: control)
         }
     }
 
-    fileprivate func remove(home: URL) { workers.removeValue(forKey: home)?.close() }
+    private func takeIdleWorker(home: URL, sessionID: String?, options: Options) -> ACPWorker? {
+        expireIdle()
+        for index in idle.indices.reversed() where idle[index].home == home {
+            let worker = idle[index].worker
+            if !worker.process.isRunning || (worker.sessionID == sessionID && worker.options != options) {
+                idle.remove(at: index).worker.close()
+            }
+        }
+        let matches = idle.indices.filter { idle[$0].home == home && idle[$0].worker.options == options }
+        let preferred = matches.last { idle[$0].worker.sessionID == sessionID }
+        let index = preferred ?? matches.last(where: { idle[$0].worker.sessionID == nil })
+            ?? (options.sessionScopedMCP || (options.reuseDraftWorker && sessionID == nil) ? matches.last : nil)
+        return index.map { idle.remove(at: $0).worker }
+    }
+
+    private func prepare(_ runtime: HermesRuntime, home: URL, options: Options, generation: UUID?) throws -> [String: String] {
+        let environment = try runtime.prepare(home: home, withVision: !options.draft || options.withVision, skillIDs: options.skillIDs,
+            draft: options.draft, mcpServers: options.mcpServers, proxyRange: options.proxyRange, toolsets: options.toolsets,
+            budget: options.budget)
+        queue.sync {
+            if generations[home] == generation { profileOptions[home] = options }
+        }
+        return environment
+    }
+
+    private func recycle(_ worker: ACPWorker, home: URL, speculative: Bool) {
+        guard idleCapacity > 0 else { worker.close(); retireIfUnused(home: home); return }
+        while idle.count >= effectiveIdleCapacity {
+            let index = idle.firstIndex(where: \.speculative) ?? idle.firstIndex { !preferredHomes.contains($0.home) } ?? 0
+            let entry = idle.remove(at: index)
+            entry.worker.close()
+            retireIfUnused(home: entry.home)
+        }
+        idle.append(IdleEntry(home: home, worker: worker, since: .now, speculative: speculative))
+        scheduleExpiry()
+    }
+
+    private func deadline(for entry: IdleEntry) -> ContinuousClock.Instant {
+        let timeout = entry.speculative ? min(idleTimeout, 45)
+            : preferredHomes.contains(entry.home) ? max(idleTimeout, 300) : idleTimeout
+        return entry.since + .seconds(timeout)
+    }
+
+    private func scheduleExpiry() {
+        expiry?.cancel()
+        guard let next = idle.map(deadline).min() else { expiry = nil; return }
+        expiry = Task { [weak self] in
+            do { try await Task.sleep(until: next, clock: .continuous) } catch { return }
+            self?.queue.async { [weak self] in self?.expireIdle() }
+        }
+    }
+
+    private func expireIdle() {
+        let now = ContinuousClock.now
+        for index in idle.indices.reversed() where deadline(for: idle[index]) <= now {
+            let entry = idle.remove(at: index)
+            entry.worker.close()
+            retireIfUnused(home: entry.home)
+        }
+        scheduleExpiry()
+    }
+
+    fileprivate func keepWarm(homes: Set<URL>, idleLimit: Int) {
+        queue.async {
+            guard self.preferredHomes != homes || self.preferredIdleLimit != idleLimit else { return }
+            self.preferredHomes = homes
+            self.preferredIdleLimit = idleLimit
+            self.prewarmEpoch = UUID()
+            for index in self.idle.indices.reversed() where self.idle[index].speculative && !homes.contains(self.idle[index].home) {
+                let entry = self.idle.remove(at: index)
+                entry.worker.close()
+                self.retireIfUnused(home: entry.home)
+            }
+            while self.idle.filter({ !homes.contains($0.home) }).count > self.idleCapacity {
+                guard let index = self.idle.firstIndex(where: { !homes.contains($0.home) }) else { break }
+                let entry = self.idle.remove(at: index)
+                entry.worker.close()
+                self.retireIfUnused(home: entry.home)
+            }
+            while self.idle.count > self.effectiveIdleCapacity {
+                let index = self.idle.firstIndex { !homes.contains($0.home) } ?? 0
+                let entry = self.idle.remove(at: index)
+                entry.worker.close()
+                self.retireIfUnused(home: entry.home)
+            }
+            self.expireIdle()
+        }
+    }
+
+    private func retireIfUnused(home: URL) {
+        guard inUse[home, default: 0] == 0, !idle.contains(where: { $0.home == home }) else { return }
+        setup(home: home) {
+            let unused = self.queue.sync { self.inUse[home, default: 0] == 0 && !self.idle.contains { $0.home == home } }
+            if unused { HermesProcessLifetime.shared.retireIdle(home: home) }
+        }
+    }
+
+    fileprivate func reset(home: URL) {
+        queue.async {
+            self.generations[home] = UUID()
+            self.profileOptions[home] = nil
+            for index in self.idle.indices.reversed() where self.idle[index].home == home {
+                self.idle.remove(at: index).worker.close()
+            }
+            self.retireIfUnused(home: home)
+            self.scheduleExpiry()
+        }
+    }
+
+    fileprivate func releaseIdle(completion: @escaping () -> Void) {
+        queue.async {
+            self.prewarmEpoch = UUID()
+            let entries = self.idle
+            self.idle.removeAll()
+            self.scheduleExpiry()
+            for entry in entries { entry.worker.close() }
+            let group = DispatchGroup()
+            for home in Set(entries.map(\.home)) {
+                group.enter()
+                self.setup(home: home) {
+                    let unused = self.queue.sync { self.inUse[home, default: 0] == 0 && !self.idle.contains { $0.home == home } }
+                    if unused { HermesProcessLifetime.shared.retireIdle(home: home) }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .global(qos: .utility), execute: completion)
+        }
+    }
 
     deinit {
-        for worker in workers.values { worker.close() }
+        expiry?.cancel()
+        for entry in idle { entry.worker.close() }
+        let homes = Set(idle.map(\.home))
+        DispatchQueue.global(qos: .utility).async {
+            for home in homes { HermesProcessLifetime.shared.retireIdle(home: home) }
+        }
     }
 }
 
 private final class ACPWorker {
     let process: Process
     let rpc: ACPConnection
-    let skillIDs: Set<String>?
-    let draft: Bool
-    let projectTools: Bool
-    var lastUse = DispatchTime.now().uptimeNanoseconds
-    private var readySessions: [String: String] = [:]
+    let options: ACPWorkerPool.Options
+    private let refreshMCP: ((String) throws -> Void)?
+    private let home: URL
+    private let previousGateway: HermesGatewayControl.Identity?
+    private var sessionMCPServers: [MCPServer.Connection] = []
+    private(set) var sessionID: String?
+    private(set) var hasDeferredModelCatalog = false
+    private var sessionPath: String?
 
-    init(process: Process, skillIDs: Set<String>?, draft: Bool, projectTools: Bool, control: TurnControl?) throws {
+    init(process: Process, home: URL, options: ACPWorkerPool.Options, refreshMCP: ((String) throws -> Void)?, control: TurnControl?) throws {
         self.process = process
-        self.skillIDs = skillIDs
-        self.draft = draft
-        self.projectTools = projectTools
+        self.options = options
+        self.refreshMCP = refreshMCP
+        self.home = home
+        previousGateway = HermesGatewayControl.identify(home: home)
+        HermesProcessLifetime.shared.willConnect(home: home, previous: previousGateway)
         let input = Pipe()
         let output = Pipe()
         process.standardInput = input
         process.standardOutput = output
         rpc = ACPConnection(input: input.fileHandleForWriting, output: output.fileHandleForReading)
         do {
-            try process.run()
+            try HermesProcessLifetime.shared.launch(process)
             try control?.attach(process)
-            _ = try rpc.call("initialize", parameters: [
+            let initialize = try rpc.call("initialize", parameters: [
                 "protocolVersion": 1,
                 "clientInfo": ["name": "hermes-studio", "version": "0.3.0"],
                 "clientCapabilities": [:]
             ])
+            hasDeferredModelCatalog = (initialize["_meta"] as? [String: Any])?["studioModelCatalog"] as? Int == 1
+            HermesProcessLifetime.shared.observe(home: home, previous: previousGateway)
         } catch {
             close()
             control?.detach()
@@ -408,18 +864,19 @@ private final class ACPWorker {
         }
     }
 
-    func session(existing: String?, workspace: URL) throws -> String {
+    func session(existing: String?, workspace: URL, mcpServers: [MCPServer.Connection] = []) throws -> String {
         let path = workspace.path
-        var params: [String: Any] = ["cwd": path, "mcpServers": []]
+        var params: [String: Any] = ["cwd": path, "mcpServers": mcpServers.map(\.acpSpecification)]
         let id: String
         let response: [String: Any]
         if let existing {
-            if readySessions[existing] == path { return existing }
+            if sessionID == existing, sessionPath == path, sessionMCPServers == mcpServers { return existing }
             params["sessionId"] = existing
             response = try rpc.call("session/load", parameters: params)
             guard !response.isEmpty else {
                 throw StudioError.message("无法恢复 Hermes 对话。请新建对话后再试。")
             }
+            try refreshMCP?(existing)
             id = existing
         } else {
             response = try rpc.call("session/new", parameters: params)
@@ -429,15 +886,28 @@ private final class ACPWorker {
             id = created
         }
         rpc.recordSettings(response, sessionID: id)
-        readySessions[id] = path
+        sessionID = id
+        sessionPath = path
+        sessionMCPServers = mcpServers
+        HermesProcessLifetime.shared.observe(home: home, previous: previousGateway)
         return id
     }
 
-    func setRunSetting(_ field: HermesRunSettings.Field, value: String, sessionID: String) throws {
+    func loadModelChoices(sessionID: String) throws {
+        guard hasDeferredModelCatalog, rpc.modelCatalogs[sessionID] == nil else { return }
+        let result = try rpc.call("_studio/model_catalog", parameters: ["sessionId": sessionID])
+        guard let catalog = HermesRunSettings(response: result)?.model, let settings = rpc.settings[sessionID] else { return }
+        rpc.modelCatalogs[sessionID] = catalog.choices
+        rpc.settings[sessionID] = settings.includingModelChoices(catalog.choices)
+    }
+
+    func setRunSetting(_ field: HermesRunSettings.Field, value: String, sessionID: String, applyingSavedModel: Bool = false) throws {
+        let canApplySavedModel = field == .model && applyingSavedModel && hasDeferredModelCatalog
         guard let current = rpc.settings[sessionID],
-            current[field]?.choices.contains(where: { $0.id == value }) == true else {
+            current[field]?.choices.contains(where: { $0.id == value }) == true || canApplySavedModel else {
             throw StudioError.message("Hermes 未提供这个选项，请重新打开运行设置。")
         }
+        if current[field]?.value == value { return }
         if field == .model, current.modelUsesLegacyMethod {
             _ = try rpc.call("session/set_model", parameters: ["sessionId": sessionID, "modelId": value])
             rpc.settings[sessionID] = current.settingLegacyModel(value)
@@ -449,10 +919,11 @@ private final class ACPWorker {
                 "sessionId": sessionID, "configId": field.rawValue, "value": value
             ])
             guard let applied = HermesRunSettings(response: response, previous: rpc.settings[sessionID]),
-                let selected = applied[field], field != .editApproval || selected.value == value else {
+                let selected = applied[field],
+                field == .model || (field == .effort && value == "default") || selected.value == value else {
                 throw StudioError.message("Hermes 没有应用所选设置。")
             }
-            rpc.settings[sessionID] = applied
+            rpc.storeSettings(applied, sessionID: sessionID)
         }
     }
 
@@ -471,11 +942,16 @@ final class ACPConnection {
     private let writeLock = NSLock()
     private var queueSessions: Set<String> = []
     fileprivate var settings: [String: HermesRunSettings] = [:]
+    fileprivate var modelCatalogs: [String: [HermesRunSettings.Choice]] = [:]
 
     fileprivate func recordSettings(_ response: [String: Any], sessionID: String) {
         if let parsed = HermesRunSettings(response: response, previous: settings[sessionID]) {
-            settings[sessionID] = parsed
+            storeSettings(parsed, sessionID: sessionID)
         }
+    }
+
+    fileprivate func storeSettings(_ value: HermesRunSettings, sessionID: String) {
+        settings[sessionID] = modelCatalogs[sessionID].map { value.includingModelChoices($0) } ?? value
     }
 
     init(input: FileHandle, output: FileHandle) {
@@ -486,7 +962,8 @@ final class ACPConnection {
 
     func call(
         _ method: String, parameters: [String: Any], timeout: DispatchTimeInterval = .seconds(30),
-        control: TurnControl? = nil, onPermission: (ToolPermission) -> Void = { _ in },
+        control: TurnControl? = nil, cancellation: TurnControl? = nil,
+        onPermission: (ToolPermission) -> Void = { _ in },
         onFollowUpReady: () -> Void = {},
         onFollowUpStarted: (UUID) -> Void = { _ in },
         onFollowUpRejected: (UUID) -> Void = { _ in },
@@ -496,7 +973,18 @@ final class ACPConnection {
         let id = nextID
         let deadline = method == "session/prompt" ? nil : DispatchTime.now() + timeout
         let sessionID = parameters["sessionId"] as? String
-        try send(["jsonrpc": "2.0", "id": id, "method": method, "params": parameters])
+        let request: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method, "params": parameters]
+        if let cancellation, let sessionID {
+            let data = try Self.encode(request)
+            try writeLock.withLock {
+                try cancellation.startPrompt { [self] in
+                    try send(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": sessionID]])
+                }
+                try input.write(contentsOf: data)
+            }
+        } else {
+            try send(request)
+        }
         if method == "session/prompt", let control, let sessionID {
             control.setFollowUpSender { [self] id, text in
                 try send(["jsonrpc": "2.0", "id": id.uuidString, "method": "session/prompt", "params": [
@@ -509,7 +997,7 @@ final class ACPConnection {
         var rejectedQueueCommand = false
         let turnUpdates: Set<String> = ["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]
         while true {
-            let event = try read(until: deadline)
+            let event = try read(until: deadline, cancellation: cancellation)
             if event["method"] as? String == "session/update",
                 let params = event["params"] as? [String: Any],
                 let update = params["update"] as? [String: Any] {
@@ -555,7 +1043,7 @@ final class ACPConnection {
                 }
             } else if let serverMethod = event["method"] as? String, let serverID = event["id"] {
                 if serverMethod == "session/request_permission" {
-                    if let control, let sessionID, let params = event["params"] as? [String: Any],
+                    if let control, !control.isCancelled, let sessionID, let params = event["params"] as? [String: Any],
                         params["sessionId"] as? String == sessionID, let request = ToolPermission(params) {
                         if primaryResult != nil, let id = control.beginFollowUp() { onFollowUpStarted(id) }
                         control.register(request) { [self] option in
@@ -580,6 +1068,7 @@ final class ACPConnection {
                     case "session/new": "Hermes 无法建立本地会话。请从左下角重新检测本机 Hermes。"
                     case "session/set_mode": "Hermes 未能切换权限模式，请在回复结束后重试。"
                     case "session/set_model", "session/set_config_option": "Hermes 未能更新运行设置，请在回复结束后重试。"
+                    case "_studio/model_catalog": "Hermes 暂时无法读取模型列表，请重试。"
                     default: "Hermes 未能完成本次回复。请检查模型和认证配置后重试。"
                     }
                     throw StudioError.message(message)
@@ -603,9 +1092,14 @@ final class ACPConnection {
     }
 
     private func send(_ message: [String: Any]) throws {
+        let data = try Self.encode(message)
+        try writeLock.withLock { try input.write(contentsOf: data) }
+    }
+
+    private static func encode(_ message: [String: Any]) throws -> Data {
         var data = try JSONSerialization.data(withJSONObject: message)
         data.append(10)
-        try writeLock.withLock { try input.write(contentsOf: data) }
+        return data
     }
 
     private func sendPermissionResponse(id: Any, option: String?) throws {
@@ -613,8 +1107,11 @@ final class ACPConnection {
         try send(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]])
     }
 
-    private func read(until deadline: DispatchTime?) throws -> [String: Any] {
+    private func read(until deadline: DispatchTime?, cancellation: TurnControl?) throws -> [String: Any] {
         while true {
+            if let stopDeadline = cancellation?.stopDeadline, DispatchTime.now() >= stopDeadline {
+                throw CancellationError()
+            }
             if let end = buffer.firstIndex(of: 10) {
                 let line = Data(buffer[..<end])
                 buffer.removeSubrange(...end)
@@ -622,13 +1119,17 @@ final class ACPConnection {
                     return message
                 }
             } else {
-                if let deadline {
-                    let remaining = Int64(deadline.uptimeNanoseconds) - Int64(DispatchTime.now().uptimeNanoseconds)
-                    guard remaining > 0 else { throw StudioError.message("Hermes 初始化或恢复会话超时，请重试。") }
+                if deadline != nil || cancellation != nil {
+                    var timeout: Int32 = 100
+                    if let deadline {
+                        let remaining = Int64(deadline.uptimeNanoseconds) - Int64(DispatchTime.now().uptimeNanoseconds)
+                        guard remaining > 0 else { throw StudioError.message("Hermes 初始化或恢复会话超时，请重试。") }
+                        timeout = Int32(clamping: (remaining + 999_999) / 1_000_000)
+                    }
                     var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
-                    let result = poll(&descriptor, 1, Int32((remaining + 999_999) / 1_000_000))
-                    if result < 0, errno == EINTR { continue }
-                    guard result > 0 else { throw StudioError.message("Hermes 初始化或恢复会话超时，请重试。") }
+                    let result = poll(&descriptor, 1, timeout)
+                    if result == 0 || (result < 0 && errno == EINTR) { continue }
+                    guard result > 0 else { throw StudioError.message("无法读取 Hermes 的回复。") }
                 }
                 let data = output.availableData
                 guard !data.isEmpty else {

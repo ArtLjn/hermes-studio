@@ -48,6 +48,29 @@ extension RoleStore {
         try readProjectCatalog().projects.filter { $0.roleID == roleID }
     }
 
+    @discardableResult
+    public func removeProject(_ id: UUID, for roleID: UUID) throws -> [Conversation] {
+        var catalog = try readProjectCatalog()
+        guard let index = catalog.projects.firstIndex(where: { $0.id == id && $0.roleID == roleID }) else {
+            throw StudioError.message("找不到此助手的项目。")
+        }
+        let original = try conversations(for: roleID)
+        var threads = original
+        for index in threads.indices where threads[index].projectID == id {
+            threads[index].projectID = nil
+        }
+        let detached = threads != original
+        if detached { try saveConversations(threads, for: roleID) }
+        catalog.projects.remove(at: index)
+        do {
+            try writeProjectCatalog(catalog)
+        } catch {
+            if detached { try saveConversations(original, for: roleID) }
+            throw error
+        }
+        return threads
+    }
+
     func requireProject(_ id: UUID, for roleID: UUID) throws -> StudioProject {
         guard let project = try projects(for: roleID).first(where: { $0.id == id }) else {
             throw StudioError.message("找不到此助手的项目。")

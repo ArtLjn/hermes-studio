@@ -7,6 +7,47 @@ import XCTest
 @testable import StudioCore
 
 final class StudioCoreTests: XCTestCase {
+    func testRoleLibraryDissolvesLegacyAndArchivedMembersAndPersistsEmptyGroupOrder() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        var active = Role(name: "柚子", summary: "", template: .blank)
+        var archived = Role(name: "糖糖", summary: "", template: .blank)
+        try store.create(active, instructions: "原指令", initialMemory: [.memory: "原记忆"])
+        try store.create(archived, instructions: "")
+        active.libraryGroup = "旧分组"
+        archived.libraryGroup = "旧分组"
+        archived.archivedAt = Date()
+        for role in [active, archived] {
+            try JSONEncoder().encode(role).write(to: store.roleDirectory(role.id).appendingPathComponent("role.json"), options: .atomic)
+        }
+        var thread = Conversation(roleID: active.id)
+        thread.messages = [Message(.user, "保留这段对话")]
+        try store.save(thread)
+
+        XCTAssertEqual(try store.libraryGroups(), ["旧分组"])
+        XCTAssertEqual(try store.list().first?.libraryGroup, "旧分组")
+        XCTAssertEqual(try store.createLibraryGroup(" 工作协作 "), "工作协作")
+        XCTAssertTrue(try store.reorderLibraryGroup("工作协作", to: "旧分组"))
+        let reopened = RoleStore(root: root)
+        XCTAssertEqual(try reopened.libraryGroups(), ["工作协作", "旧分组"])
+        XCTAssertEqual(try reopened.archivedRoles().first?.libraryGroup, "旧分组")
+
+        try reopened.dissolveLibraryGroup("旧分组")
+        XCTAssertEqual(try reopened.libraryGroups(), ["工作协作"])
+        XCTAssertNil(try reopened.list().first?.libraryGroup)
+        XCTAssertNil(try reopened.archivedRoles().first?.libraryGroup)
+        XCTAssertThrowsError(try reopened.moveRoleToLibraryGroup(active.id, to: "旧分组"))
+        try reopened.createLibraryGroup("旧分组")
+        XCTAssertNil(try reopened.restore(archived.id).libraryGroup)
+        XCTAssertNil(try reopened.list().first { $0.id == active.id }?.libraryGroup)
+        XCTAssertEqual(try reopened.moveRoleToLibraryGroup(active.id, to: "工作协作")?.libraryGroup, "工作协作")
+        active.pinned = true
+        XCTAssertEqual(try reopened.update(active).libraryGroup, "工作协作")
+        XCTAssertEqual(try reopened.file(.soul, for: active.id), "原指令")
+        XCTAssertEqual(try reopened.file(.memory, for: active.id), "原记忆")
+        XCTAssertEqual(try reopened.conversations(for: active.id).first?.messages, thread.messages)
+    }
     func testGatewayRepairDiscardsOnlyTheDeadOwnerPointerFromTheOldHome() throws {
         let files = FileManager.default
         let parent = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -382,6 +423,84 @@ final class StudioCoreTests: XCTestCase {
                 tool.details?.contains(terminalMarker) == true { terminalResult = true }
         }
         XCTAssertTrue(terminalResult, "恢复项目会话后，终端应在项目工作目录运行。")
+    }
+
+    func testLiveHermesRestoresNativeTerminalAndWebInAnOldUnscopedConversation() async throws {
+        guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
+            throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证旧对话的原生终端和网页读取。")
+        }
+        let runtime = try XCTUnwrap(HermesRuntime.discover())
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "原生工具验证", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let home = store.runtime(for: role.id)
+        let workspace = home.appendingPathComponent("workspace")
+        let configURL = home.appendingPathComponent("config.yaml")
+        let environment = try runtime.prepare(home: home, withVision: true, skillIDs: nil, draft: false)
+        let raw = try JSONSerialization.jsonObject(with: Data(contentsOf: configURL))
+        var oldConfig = try XCTUnwrap(raw as? [String: Any])
+        oldConfig["platform_toolsets"] = ["acp": ["memory", "session_search"]]
+        oldConfig.removeValue(forKey: "security")
+        try JSONSerialization.data(withJSONObject: oldConfig).write(to: configURL, options: .atomic)
+
+        let oldWorker = runtime.process(arguments: ["acp"], directory: workspace, overrides: environment)
+        let input = Pipe()
+        let output = Pipe()
+        oldWorker.standardInput = input
+        oldWorker.standardOutput = output
+        try oldWorker.run()
+        defer { if oldWorker.isRunning { oldWorker.terminate() } }
+        let oldACP = ACPConnection(input: input.fileHandleForWriting, output: output.fileHandleForReading)
+        _ = try oldACP.call("initialize", parameters: ["protocolVersion": 1, "clientCapabilities": [:]])
+        let old = try oldACP.call("session/new", parameters: ["cwd": workspace.path, "mcpServers": []])
+        var conversation = Conversation(roleID: role.id)
+        conversation.sessionID = try XCTUnwrap(old["sessionId"] as? String)
+        oldWorker.terminate()
+
+        let control = TurnControl()
+        let timeout = Task {
+            try await Task.sleep(for: .seconds(95))
+            control.cancel()
+        }
+        defer {
+            timeout.cancel()
+            runtime.reset(home: home)
+        }
+        var terminal = false
+        var web = false
+        var reply = ""
+        var tools: [String: ToolRun] = [:]
+        let prompt = "请调用 terminal 运行 pwd，再调用原生 web_extract 读取 https://example.com/，最后原样输出读到的网页英文标题。请实际调用这两个工具。"
+        for await event in runtime.turn(home: home, conversation: conversation, text: prompt,
+            interactive: true, control: control) {
+            switch event {
+            case .permission(let request):
+                _ = control.respond(to: request.id, optionID: request.options.first { $0.kind == "allow_once" }?.id)
+            case .tool(let update):
+                let tool = tools[update.id]?.updating(with: update) ?? update
+                tools[tool.id] = tool
+                if tool.status == "completed" {
+                    let title = tool.title ?? ""
+                    let details = tool.details ?? ""
+                    terminal = terminal || (title.hasPrefix("terminal") && details.contains("/workspace"))
+                    web = web || title.hasPrefix("web_extract")
+                }
+            case .text(let text, _): reply += text
+            case .session:
+                XCTFail("应恢复旧的 Hermes 会话。")
+            case .finished(let reason): XCTAssertEqual(reason, "end_turn")
+            case .failed(let message): throw StudioError.message(message)
+            default: break
+            }
+        }
+        let calls = tools.values.map {
+            "\($0.title ?? "未知工具") [\($0.status ?? "")] \($0.details?.prefix(250) ?? "")"
+        }.sorted()
+        XCTAssertTrue(terminal, calls.joined(separator: "，"))
+        XCTAssertTrue(web, calls.joined(separator: "，"))
+        XCTAssertTrue(reply.localizedCaseInsensitiveContains("Example Domain"), reply)
     }
 
     func testLiveHermesLoadsSelectedSkill() async throws {

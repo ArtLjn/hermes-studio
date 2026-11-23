@@ -17,6 +17,9 @@ struct RoleEditor: View {
     @State private var name: String
     @State private var summary: String
     @State private var instructions = ""
+    @State private var originalInstructions: String?
+    @State private var showInstructions = false
+    @State private var libraryGroup: String
     @State private var inheritSkills: Bool
     @State private var selectedSkills: Set<String>
     @State private var avatar: RoleAvatar?
@@ -24,9 +27,16 @@ struct RoleEditor: View {
     @State private var choosingImage = false
     @State private var loadingImage = false
     @State private var showSkillList = false
+    @State private var showAIUpdate = false
+    @State private var showAnimalPortraits = false
+    @State private var matchAvatar: Bool
+    @State private var referenceLibrary = true
+    @State private var selectedReferences: Set<UUID> = []
+    @State private var showReferences = false
     @State private var requirement = ""
     @State private var generating = false
     @State private var generated = false
+    @State private var designNotes: [String] = []
     @State private var generation: Task<Void, Never>?
     @State private var error: String?
 
@@ -36,9 +46,14 @@ struct RoleEditor: View {
         _template = State(initialValue: role?.template ?? .blank)
         _name = State(initialValue: role?.name ?? "")
         _summary = State(initialValue: role?.summary ?? "")
+        _libraryGroup = State(initialValue: role?.libraryGroup ?? "")
         _inheritSkills = State(initialValue: role?.skillIDs == nil)
         _selectedSkills = State(initialValue: role?.skillIDs ?? [])
         _avatar = State(initialValue: role?.avatar)
+        switch role?.avatar {
+        case .custom, .symbol: _matchAvatar = State(initialValue: false)
+        default: _matchAvatar = State(initialValue: true)
+        }
     }
 
     var body: some View {
@@ -56,6 +71,12 @@ struct RoleEditor: View {
                     .pickerStyle(.segmented)
                     .frame(width: 196)
                     .disabled(generating)
+                } else {
+                    Button(showAIUpdate ? "收起 AI 更新" : "AI 更新资料", systemImage: "sparkles") {
+                        showAIUpdate.toggle()
+                    }
+                    .buttonStyle(QuietButton())
+                    .disabled(generating)
                 }
             }
             .padding(.horizontal, 22)
@@ -66,19 +87,35 @@ struct RoleEditor: View {
                     .frame(width: 187)
                     .frame(maxHeight: .infinity, alignment: .top)
                     .background(StudioPalette.sidebar)
+                    .disabled(generating)
                 Rectangle().fill(StudioPalette.line).frame(width: 1)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 15) {
-                        if role == nil && mode == .smart { smartDraft }
-                        Group {
-                            FormField("角色名称", placeholder: "例如：会议整理助手", text: $name)
-                            FormField("角色简介", placeholder: "用一句话介绍这个角色（选填）", text: $summary, multiline: true)
-                            if role == nil { instructionsField }
-                            skillPicker
+                ScrollViewReader { scroll in
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 15) {
+                            if role == nil ? mode == .smart : showAIUpdate {
+                                smartDraft {
+                                    showInstructions = true
+                                    scroll.scrollTo("role-instructions", anchor: .center)
+                                }
+                            }
+                            Group {
+                                FormField("角色名称", placeholder: "例如：会议整理助手", text: $name)
+                                FormField("角色简介", placeholder: "用一句话介绍这个角色（选填）", text: $summary, multiline: true)
+                                libraryGroupField
+                                if role == nil { instructionsField.id("role-instructions") }
+                                else if originalInstructions != nil {
+                                    DisclosureGroup("角色指令", isExpanded: $showInstructions) {
+                                        instructionsField.padding(.top, 8)
+                                    }
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .id("role-instructions")
+                                }
+                                skillPicker
+                            }
+                            .disabled(generating)
                         }
-                        .disabled(generating)
+                        .padding(18)
                     }
-                    .padding(18)
                 }
             }
             Divider().overlay(StudioPalette.line)
@@ -94,6 +131,7 @@ struct RoleEditor: View {
         .foregroundStyle(StudioPalette.ink)
         .background(.regularMaterial)
         .fileImporter(isPresented: $choosingImage, allowedContentTypes: [.image], onCompletion: loadPortrait)
+        .onAppear(perform: loadInstructions)
         .onDisappear { generation?.cancel() }
     }
 
@@ -103,15 +141,35 @@ struct RoleEditor: View {
 
     private var instructionsField: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("角色指令").font(.system(size: 12, weight: .semibold))
+            if role == nil { Text("角色指令").font(.system(size: 12, weight: .semibold)) }
             TextEditor(text: $instructions)
                 .font(.system(size: 13))
                 .scrollContentBackground(.hidden)
                 .padding(7)
-                .frame(height: 109)
+                .frame(height: 170)
                 .background(StudioPalette.sidebar, in: RoundedRectangle(cornerRadius: 8))
                 .overlay { RoundedRectangle(cornerRadius: 8).strokeBorder(StudioPalette.line).allowsHitTesting(false) }
                 .accessibilityLabel("角色指令")
+        }
+    }
+
+    private var libraryGroupField: some View {
+        let groups = studio.libraryGroups
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("角色分组").font(.system(size: 12, weight: .semibold))
+            HStack(spacing: 7) {
+                TextField("输入分组名称，留空为未分组", text: $libraryGroup)
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("角色分组")
+                if !groups.isEmpty {
+                    Menu("选择分组") {
+                        Button("未分组") { libraryGroup = "" }
+                        Divider()
+                        ForEach(groups, id: \.self) { group in Button(group) { libraryGroup = group } }
+                    }
+                    .fixedSize()
+                }
+            }
         }
     }
 
@@ -134,8 +192,8 @@ struct RoleEditor: View {
                         .font(.system(size: 12, weight: .semibold)).lineLimit(1)
                 }
                 .frame(maxWidth: .infinity)
-                portraitRow(RoleIllustration.people)
-                DisclosureGroup("动物插画") {
+                peoplePortraitPicker
+                DisclosureGroup("动物插画", isExpanded: $showAnimalPortraits) {
                     portraitRow(RoleIllustration.animals)
                         .padding(.top, 6)
                 }
@@ -172,6 +230,24 @@ struct RoleEditor: View {
         }
     }
 
+    private var peoplePortraitPicker: some View {
+        ScrollViewReader { scroll in
+            ScrollView(.horizontal) {
+                portraitRow(RoleIllustration.people)
+                    .padding(.bottom, 8)
+            }
+            .scrollIndicators(.visible)
+            .scrollIndicatorsFlash(onAppear: true)
+            .accessibilityLabel("人物头像")
+            .onChange(of: effectiveAvatar, initial: true) { _, selection in
+                if case .illustration(let item) = selection,
+                    RoleIllustration.people.contains(item) {
+                    scroll.scrollTo(item)
+                }
+            }
+        }
+    }
+
     private func portraitRow(_ items: [RoleIllustration]) -> some View {
         HStack(spacing: 4) {
             ForEach(items) { item in
@@ -182,6 +258,7 @@ struct RoleEditor: View {
                         .background(selected ? StudioPalette.accent : .clear, in: RoundedRectangle(cornerRadius: 9))
                 }
                 .buttonStyle(.plain)
+                .id(item)
                 .help(item.label)
                 .accessibilityLabel("\(item.label)插画头像")
                 .accessibilityAddTraits(selected ? .isSelected : [])
@@ -190,30 +267,91 @@ struct RoleEditor: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var smartDraft: some View {
+    private func smartDraft(reviewInstructions: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("描述你需要的角色", systemImage: "sparkles")
+            Label(role == nil ? "描述你需要的角色" : "你想怎么更新？", systemImage: "sparkles")
                 .font(.system(size: 13, weight: .semibold))
-            TextField("例如：整理会议纪要，列出决策和待办", text: $requirement, axis: .vertical)
+            TextField(role == nil ? "例如：做一个善于陪我复盘的助手，和现有角色有明显区别" : "例如：更关心我，但少用甜腻称呼。保留原来的工作职责",
+                text: $requirement, axis: .vertical)
                 .lineLimit(2...4)
                 .textFieldStyle(.plain)
                 .padding(8)
                 .background(StudioPalette.background.opacity(0.45), in: RoundedRectangle(cornerRadius: 6))
-                .accessibilityLabel("角色用途")
+                .accessibilityLabel(role == nil ? "角色用途" : "资料更新要求")
                 .disabled(generating)
-            HStack {
+            HStack(spacing: 8) {
+                Toggle("自动匹配头像", isOn: $matchAvatar)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11))
+                    .disabled(generating)
+                Spacer()
                 if generated {
-                    Label("草稿已填入下方", systemImage: "checkmark.circle")
+                    Label("草稿已填入，可继续编辑", systemImage: "checkmark.circle")
                         .font(.system(size: 11)).foregroundStyle(StudioPalette.accent)
                 }
-                Spacer()
-                Button(generating ? "正在生成…" : "生成草稿", action: generate)
+                if generating {
+                    ProgressView().controlSize(.small).accessibilityLabel("正在生成")
+                }
+                Button(role == nil ? "生成草稿" : "生成更新草稿", action: generate)
                     .buttonStyle(QuietButton())
-                    .disabled(generating || requirement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(generating || loadingImage || requirement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if !referenceCandidates.isEmpty { referenceControls }
+            if !designNotes.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("设定分析").fontWeight(.semibold)
+                    ForEach(Array(designNotes.enumerated()), id: \.offset) { _, note in
+                        Text(note).foregroundStyle(StudioPalette.muted).textSelection(.enabled)
+                    }
+                }
+                .font(.system(size: 11))
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if generated && (role == nil || instructions != originalInstructions) {
+                Button("查看角色指令", action: reviewInstructions).buttonStyle(QuietButton())
             }
         }
         .padding(11)
         .background(StudioPalette.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var referenceCandidates: [Role] { studio.roles.filter { $0.id != role?.id } }
+
+    private var referenceControls: some View {
+        HStack(spacing: 8) {
+            Toggle("参考角色库", isOn: $referenceLibrary)
+                .toggleStyle(.checkbox)
+                .help("使用现有助手的名称、简介和分组，分析定位与分工")
+            Spacer()
+            Button(selectedReferences.isEmpty ? "选择深入参考" : "深入参考（\(selectedReferences.count)）") { showReferences.toggle() }
+                .buttonStyle(QuietButton())
+                .disabled(!referenceLibrary)
+                .popover(isPresented: $showReferences, arrowEdge: .bottom) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("最多选 3 位，额外参考各自的角色指令片段。")
+                            .foregroundStyle(StudioPalette.muted)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 8) {
+                                ForEach(referenceCandidates) { candidate in
+                                    Toggle(candidate.name, isOn: Binding(get: { selectedReferences.contains(candidate.id) },
+                                        set: { selected in
+                                            if selected { selectedReferences.insert(candidate.id) }
+                                            else { selectedReferences.remove(candidate.id) }
+                                        }))
+                                        .toggleStyle(.checkbox)
+                                        .disabled(selectedReferences.count >= 3 && !selectedReferences.contains(candidate.id))
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(height: CGFloat(min(referenceCandidates.count, 7)) * 24)
+                        Button("完成") { showReferences = false }.buttonStyle(QuietButton())
+                    }
+                    .padding(12).frame(width: 300)
+                }
+        }
+        .font(.system(size: 11))
+        .disabled(generating)
     }
 
     private var skillPicker: some View {
@@ -239,6 +377,7 @@ struct RoleEditor: View {
     private func chooseAvatar(_ selection: RoleAvatar) {
         pendingAvatar = nil
         avatar = selection
+        matchAvatar = false
     }
 
     private func loadPortrait(_ selection: Result<URL, Error>) {
@@ -250,33 +389,91 @@ struct RoleEditor: View {
             Task {
                 defer { loadingImage = false }
                 let result = await Task.detached { Result { try ImagePayload.load(url) } }.value
-                do { pendingAvatar = try result.get() }
+                do {
+                    pendingAvatar = try result.get()
+                    matchAvatar = false
+                }
                 catch { self.error = error.localizedDescription }
             }
         }
     }
 
     private func generate() {
-        guard !generating else { return }
+        let request = requirement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !generating, !loadingImage, !request.isEmpty else { return }
+        let shouldMatchAvatar = matchAvatar
+        let usesLibrary = referenceLibrary
+        let references = selectedReferences
+        let group = try? studio.libraryGroup(named: libraryGroup)
+        if role != nil && originalInstructions == nil {
+            loadInstructions()
+            guard originalInstructions != nil else { return }
+        }
         generating = true
         generated = false
+        designNotes = []
         error = nil
         generation = Task {
             defer { generating = false }
             do {
-                let draft = try await studio.suggestRole(requirement)
-                try Task.checkCancellation()
-                template = .blank
-                name = draft.name
-                summary = draft.summary
-                instructions = draft.instructions
-                selectedSkills = draft.skillIDs
-                inheritSkills = false
+                if var profile = role {
+                    profile.name = name
+                    profile.summary = summary
+                    profile.skillIDs = inheritSkills ? nil : selectedSkills
+                    profile.avatar = pendingAvatar.map { .custom($0.image) } ?? effectiveAvatar
+                    profile.libraryGroup = group
+                    let update = try await studio.suggestRoleUpdate(request, for: profile, matchAvatar: shouldMatchAvatar,
+                        currentInstructions: instructions, referenceLibrary: usesLibrary, selectedReferences: references)
+                    try Task.checkCancellation()
+                    if let suggestedName = update.name { name = suggestedName }
+                    if let suggestedSummary = update.summary { summary = suggestedSummary }
+                    if let suggestedInstructions = update.instructions {
+                        instructions = suggestedInstructions
+                        showInstructions = true
+                    }
+                    designNotes = update.designNotes ?? []
+                    if update.inheritSkills == true {
+                        inheritSkills = true
+                    } else if let skillIDs = update.skillIDs {
+                        selectedSkills = skillIDs
+                        inheritSkills = false
+                    }
+                    applySuggestedAvatar(update.avatar)
+                } else {
+                    let draft = try await studio.suggestRole(request, matchAvatar: shouldMatchAvatar, referenceLibrary: usesLibrary,
+                        group: group, selectedReferences: references)
+                    try Task.checkCancellation()
+                    if avatar == nil, draft.avatar == nil { avatar = effectiveAvatar }
+                    template = .blank
+                    name = draft.name
+                    summary = draft.summary
+                    instructions = draft.instructions
+                    designNotes = draft.designNotes ?? []
+                    selectedSkills = draft.skillIDs
+                    inheritSkills = false
+                    applySuggestedAvatar(draft.avatar)
+                }
                 generated = true
             } catch is CancellationError {
                 return
             } catch { self.error = error.localizedDescription }
         }
+    }
+
+    private func loadInstructions() {
+        guard let role, originalInstructions == nil else { return }
+        do {
+            let contents = try studio.store.file(.soul, for: role.id)
+            originalInstructions = contents
+            instructions = contents
+        } catch { self.error = error.localizedDescription }
+    }
+
+    private func applySuggestedAvatar(_ suggestion: RoleIllustration?) {
+        guard let suggestion else { return }
+        pendingAvatar = nil
+        avatar = .illustration(suggestion)
+        if RoleIllustration.animals.contains(suggestion) { showAnimalPortraits = true }
     }
 
     private func choose(_ choice: RoleTemplate) {
@@ -296,19 +493,26 @@ struct RoleEditor: View {
             return
         }
         do {
+            let group = try studio.libraryGroup(named: libraryGroup)
             if var role {
+                let changedLibraryGroup = role.libraryGroup != group
+                let editedInstructions = originalInstructions.flatMap { instructions == $0 ? nil : instructions }
+                if editedInstructions != nil, try studio.store.file(.soul, for: role.id) != originalInstructions {
+                    throw StudioError.message("角色指令已在其他地方更新。请重新打开编辑页面后再应用草稿。")
+                }
                 role.name = displayName
                 role.summary = detail
+                role.libraryGroup = group
                 role.skillIDs = inheritSkills ? nil : selectedSkills
                 if let pendingAvatar {
                     role.avatar = .custom(try studio.store.saveImage(pendingAvatar, for: role.id))
                 } else {
                     role.avatar = avatar
                 }
-                try studio.updateRole(role)
+                try studio.updateRole(role, instructions: editedInstructions, changeLibraryGroup: changedLibraryGroup)
             } else {
                 try studio.createRole(name: displayName, summary: detail, instructions: instructions, template: template,
-                    skillIDs: inheritSkills ? nil : selectedSkills, avatar: avatar, avatarImage: pendingAvatar)
+                    skillIDs: inheritSkills ? nil : selectedSkills, avatar: avatar, avatarImage: pendingAvatar, libraryGroup: group)
             }
             dismiss()
         } catch {

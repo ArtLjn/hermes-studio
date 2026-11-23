@@ -1,5 +1,69 @@
 import Foundation
 
+public enum HermesApprovalMode: String, CaseIterable, Codable, Sendable {
+    case manual, workspace, editWithoutApproval, fullAccess
+
+    public init?(nativeID: String) {
+        switch nativeID {
+        case "ask", "default": self = .manual
+        case "workspace_session", "accept_edits": self = .workspace
+        case "session", "dont_ask": self = .editWithoutApproval
+        default: return nil
+        }
+    }
+
+    func nativeChoice(in selection: HermesRunSettings.Selection?) -> HermesRunSettings.Choice? {
+        let mode = self == .fullAccess ? .editWithoutApproval : self
+        return selection?.choices.first { Self(nativeID: $0.id) == mode }
+    }
+}
+
+public struct HermesRunPreferences: Codable, Equatable, Sendable {
+    public var modelID: String?
+    public var modelName: String?
+    public var effort: String?
+    public private(set) var approval: HermesApprovalMode?
+    public private(set) var managesTerminalApproval = false
+    public var groupFullAccess: Bool?
+
+    public var enablesGroupFullAccess: Bool { groupFullAccess == true && approval == .fullAccess }
+
+    public init() {}
+
+    private static let storageKey = "studio.runPreferences"
+
+    public static func load(from defaults: UserDefaults = .standard) -> Self {
+        guard let data = defaults.data(forKey: storageKey),
+            let saved = try? JSONDecoder().decode(Self.self, from: data) else { return Self() }
+        return saved
+    }
+
+    public func save(to defaults: UserDefaults = .standard) {
+        if let data = try? JSONEncoder().encode(self) {
+            defaults.set(data, forKey: Self.storageKey)
+        }
+    }
+
+    public mutating func startManagingTerminalApproval() { managesTerminalApproval = true }
+
+    public mutating func selectApproval(_ mode: HermesApprovalMode) {
+        approval = mode
+        // 旧会话可能保有 YOLO，降级后仍须在每次恢复时撤销。
+        if mode == .fullAccess { startManagingTerminalApproval() }
+    }
+}
+
+public enum HermesTerminalApprovalError: LocalizedError {
+    case unsupported, unconfirmed
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupported: "当前 Hermes 不支持会话终端权限切换。请升级 Hermes 后重试。"
+        case .unconfirmed: "无法确认 Hermes 的终端权限，请重试。"
+        }
+    }
+}
+
 public struct HermesRunSettings: Equatable, Sendable {
     public enum Field: String, Sendable {
         case model
@@ -76,6 +140,14 @@ public struct HermesRunSettings: Equatable, Sendable {
     func settingLegacyModel(_ id: String) -> Self {
         Self(model: model.map { Selection(value: id, choices: $0.choices) }, effort: effort, editApproval: editApproval,
             modelUsesLegacyMethod: true, editApprovalUsesLegacyMethod: editApprovalUsesLegacyMethod)
+    }
+
+    func includingModelChoices(_ catalog: [Choice]) -> Self {
+        guard let model else { return self }
+        let current = catalog.contains(where: { $0.id == model.value }) ? [] : model.choices.filter { $0.id == model.value }
+        return Self(model: Selection(value: model.value, choices: catalog + current), effort: effort,
+            editApproval: editApproval, modelUsesLegacyMethod: modelUsesLegacyMethod,
+            editApprovalUsesLegacyMethod: editApprovalUsesLegacyMethod)
     }
 
     func settingLegacyEditApproval(_ id: String) -> Self {

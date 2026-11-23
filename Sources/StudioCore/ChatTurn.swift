@@ -5,6 +5,13 @@ public struct ChatTurn: Identifiable {
     public let messages: [Message]
     public var id: UUID { request?.id ?? messages[0].id }
 
+    public var canContinue: Bool {
+        guard let request, request.handoff == nil, request.consultation == nil else { return false }
+        if let interrupted = request.interrupted { return interrupted }
+        // 旧版没有保存停止状态，只识别以已停止工具结束的回合。
+        return messages.last?.tool?.status == "cancelled"
+    }
+
     public struct Activity: Identifiable {
         public let messages: [Message]
         public let tools: [ToolRun]

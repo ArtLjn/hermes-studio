@@ -167,6 +167,73 @@ final class ComposerAndRuntimeTests: XCTestCase {
         XCTAssertEqual(try RoleStore.readFile(.memory, in: source), "原始记忆")
     }
 
+    func testRoleDraftKeepsAllRelevantSkillIDsAndOnlyValidAvatars() throws {
+        let skills = (1...7).map { HermesSkill(id: "技能\($0)", name: "技能\($0)", summary: "") }
+        let identifiers = skills.map { "\"\($0.id)\"" }.joined(separator: ",")
+        let response = """
+            {"name":"设计搭档","summary":"协助创作","instructions":"协助设计。",
+            "skillIDs":[\(identifiers),"不存在"],"avatarID":"jadeBun"}
+            """
+        let draft = try RoleSuggestion.parse(response, catalog: skills)
+        XCTAssertEqual(draft.skillIDs, Set(skills.map(\.id)))
+        XCTAssertEqual(draft.avatar, .jadeBun)
+        XCTAssertNil(try RoleSuggestion.parse(response, catalog: skills, matchAvatar: false).avatar)
+
+        let empty = try RoleSuggestion.parse("""
+            {"name":"闲聊搭档","summary":"随时聊天","instructions":"聊日常。","skillIDs":[],"avatarID":"虚构头像"}
+            """, catalog: skills)
+        XCTAssertTrue(empty.skillIDs.isEmpty)
+        XCTAssertNil(empty.avatar)
+    }
+
+    func testProfileUpdateDistinguishesOmittedSkillsFromExplicitlyClearedSkills() throws {
+        let summaryOnly = try RoleProfileSuggestion.parse("""
+            {"summary":"整理行动项"}
+            """, catalog: [])
+        XCTAssertEqual(summaryOnly.summary, "整理行动项")
+        XCTAssertNil(summaryOnly.name)
+        XCTAssertNil(summaryOnly.skillIDs)
+        XCTAssertNil(summaryOnly.inheritSkills)
+        XCTAssertNil(summaryOnly.avatar)
+        XCTAssertNil(summaryOnly.instructions)
+
+        let cleared = try RoleProfileSuggestion.parse("""
+            {"skillIDs":[],"avatarID":"pearlBob"}
+            """, catalog: [])
+        XCTAssertEqual(cleared.skillIDs, [])
+        XCTAssertEqual(cleared.avatar, .pearlBob)
+        let unknown = try RoleProfileSuggestion.parse("""
+            {"skillIDs":["不存在"],"avatarID":"pearlBob"}
+            """, catalog: [], matchAvatar: false)
+        XCTAssertNil(unknown.skillIDs)
+        XCTAssertNil(unknown.avatar)
+        XCTAssertEqual(try RoleProfileSuggestion.parse("{\"inheritSkills\":true}", catalog: []).inheritSkills, true)
+    }
+
+    func testRoleDraftReferencesUseCatalogAndOnlyReadSelectedInstructions() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        var sugar = Role(name: "糖糖", summary: "先回应感受，擅长接梗。", template: .blank)
+        sugar.libraryGroup = "日常陪伴"
+        let pomelo = Role(name: "柚子", summary: "一起复盘。", template: .blank)
+        let archived = Role(name: "已归档", summary: "不参与分析。", template: .blank)
+        try store.create(sugar, instructions: String(repeating: "甲", count: 2000), initialMemory: [.memory: "私有记忆"])
+        try store.create(pomelo, instructions: "保留自己的工作职责。")
+        try store.create(archived, instructions: "归档指令")
+        _ = try store.archive(archived.id)
+
+        let catalog = try store.draftReferences(for: "参考糖糖", excluding: pomelo.id)
+        XCTAssertEqual(catalog.map(\.name), ["糖糖"])
+        XCTAssertEqual(catalog.first?.group, "日常陪伴")
+        XCTAssertNil(catalog.first?.instructions)
+        let selected = try store.draftReferences(for: "参考糖糖", excluding: pomelo.id, selected: [sugar.id, archived.id])
+        XCTAssertEqual(selected.first?.instructions?.count, 1800)
+        XCTAssertEqual(selected.count, 1)
+        let encoded = String(decoding: try JSONEncoder().encode(selected), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("私有记忆"))
+    }
+
     func testTerminalChatReopensTheSameRoleAndKeepsOriginalMemorySeparate() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -279,7 +346,8 @@ final class ComposerAndRuntimeTests: XCTestCase {
             .split(whereSeparator: \.isNewline).map(String.init)
         XCTAssertEqual(methods, ["initialize", "session/new", "session/prompt", "session/prompt", "initialize", "session/load", "session/prompt"])
         let config = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: home.appendingPathComponent("config.yaml"))) as? [String: Any])
-        XCTAssertEqual((config["platform_toolsets"] as? [String: [String]])?["acp"], ["memory", "session_search"])
+        XCTAssertEqual((config["platform_toolsets"] as? [String: [String]])?["acp"], ["all"])
+        XCTAssertEqual((config["agent"] as? [String: [String]])?["disabled_toolsets"], ["skills"])
     }
 
     func testRunSettingsPreserveNativeModelIDsAndEffortReset() throws {
@@ -317,8 +385,14 @@ final class ComposerAndRuntimeTests: XCTestCase {
         let role = Role(name: "运行设置验收", summary: "", template: .blank)
         try store.create(role, instructions: "")
         let home = store.runtime(for: role.id)
-        let prepared = try await runtime.runSettings(home: home, sessionID: nil)
-        let model = try XCTUnwrap(prepared.settings?.model)
+        let prepared = try await runtime.runSettings(home: home, sessionID: nil, includeModelChoices: false)
+        let initialModel = try XCTUnwrap(prepared.settings?.model)
+        XCTAssertLessThanOrEqual(initialModel.choices.count, 1)
+        XCTAssertFalse(try XCTUnwrap(prepared.settings?.editApproval).choices.isEmpty)
+        let listed = try await runtime.runSettings(home: home, sessionID: prepared.id, includeModelChoices: true)
+        let model = try XCTUnwrap(listed.settings?.model)
+        XCTAssertEqual(listed.id, prepared.id)
+        XCTAssertEqual(initialModel.value, model.value)
         XCTAssertTrue(model.choices.contains { $0.id == model.value })
         let provider = model.value.split(separator: ":", maxSplits: 1).first.map(String.init) ?? ""
         guard let target = model.choices.first(where: { $0.id.hasPrefix(provider + ":") && $0.id != model.value })?.id else {
@@ -385,6 +459,74 @@ final class ComposerAndRuntimeTests: XCTestCase {
         XCTAssertEqual(older.settingLegacyEditApproval("accept_edits").editApproval?.value, "accept_edits")
     }
 
+    func testRunPreferencesRememberModelEffortAndApprovalReplacement() throws {
+        let suite = "studio.test.run-preferences.\(UUID())"
+        let firstLaunch = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { firstLaunch.removePersistentDomain(forName: suite) }
+        XCTAssertEqual(HermesRunPreferences.load(from: firstLaunch), .init())
+        var preferences = HermesRunPreferences()
+        preferences.modelID = "provider:example"
+        preferences.modelName = "示例模型"
+        preferences.effort = "high"
+        preferences.selectApproval(.fullAccess)
+        preferences.save(to: firstLaunch)
+
+        let nextLaunch = try XCTUnwrap(UserDefaults(suiteName: suite))
+        var restored = HermesRunPreferences.load(from: nextLaunch)
+        XCTAssertEqual(restored, preferences)
+        restored.selectApproval(.workspace)
+        restored.save(to: nextLaunch)
+        let downgraded = HermesRunPreferences.load(from: firstLaunch)
+        XCTAssertEqual(downgraded.approval, .workspace)
+        XCTAssertTrue(downgraded.managesTerminalApproval)
+        XCTAssertEqual(downgraded.modelID, "provider:example")
+        XCTAssertEqual(downgraded.effort, "high")
+    }
+
+    func testLiveHermesRemembersRunPreferencesAcrossSessions() async throws {
+        guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
+            throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证新旧对话应用记忆设置。")
+        }
+        let runtime = try XCTUnwrap(HermesRuntime.discover())
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let store = RoleStore(root: root)
+        let role = Role(name: "权限记忆验收", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let home = store.runtime(for: role.id)
+        defer {
+            runtime.reset(home: home)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let first = try await runtime.runSettings(home: home, sessionID: nil)
+        let models = try XCTUnwrap(first.settings?.model)
+        let provider = models.value.split(separator: ":", maxSplits: 1).first
+        let alternate = models.choices.first { $0.id != models.value && $0.id.split(separator: ":", maxSplits: 1).first == provider }
+        var preferences = HermesRunPreferences()
+        preferences.modelID = alternate?.id ?? models.value
+        let effort = try XCTUnwrap(first.settings?.effort)
+        preferences.effort = try XCTUnwrap(effort.choices.first { $0.id == "low" && $0.id != effort.value }?.id
+            ?? effort.choices.first { $0.id == "high" }?.id)
+        preferences.selectApproval(.fullAccess)
+
+        let existing = try await runtime.runSettings(home: home, sessionID: first.id, preferences: preferences)
+        XCTAssertEqual(existing.settings?.model?.value, models.value)
+        XCTAssertEqual(existing.settings?.effort?.value, effort.value)
+        XCTAssertEqual(existing.settings?.editApproval?.value, "session")
+        let next = try await runtime.runSettings(home: home, sessionID: nil,
+            preferences: preferences, useModelDefaults: true)
+        XCTAssertNotEqual(next.id, first.id)
+        XCTAssertEqual(next.settings?.model?.value, preferences.modelID)
+        XCTAssertEqual(next.settings?.effort?.value, preferences.effort)
+        XCTAssertEqual(next.settings?.editApproval?.value, "session")
+
+        runtime.reset(home: home)
+        preferences.selectApproval(.workspace)
+        for id in [first.id, next.id] {
+            let reverted = try await runtime.runSettings(home: home, sessionID: id, preferences: preferences)
+            XCTAssertEqual(reverted.settings?.editApproval?.value, "workspace_session")
+        }
+    }
+
     func testLiveHermesSwitchesNativeEditApprovalModes() async throws {
         guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
             throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证编辑权限。")
@@ -426,6 +568,25 @@ final class ComposerAndRuntimeTests: XCTestCase {
         XCTAssertFalse(draft.instructions.isEmpty)
         XCTAssertTrue(draft.skillIDs.isSubset(of: skills.map(\.id)))
         if !skills.isEmpty { XCTAssertFalse(draft.skillIDs.isEmpty) }
+        XCTAssertNotNil(draft.avatar)
+    }
+
+    func testLiveRoleSuggestionUpdatesOnlyTheRequestedSummary() async throws {
+        guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
+            throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证 AI 更新角色资料。")
+        }
+        let runtime = try XCTUnwrap(HermesRuntime.discover())
+        var current = Role(name: "会后搭档", summary: "整理讨论。", template: .blank)
+        current.avatar = .illustration(.pearlBob)
+        let update = try await runtime.suggestRoleUpdate(for: current,
+            request: "只改简介，写明我会整理会议纪要并跟进待办。", skills: [])
+        let summary = try XCTUnwrap(update.summary)
+        XCTAssertTrue(summary.contains("会议纪要"))
+        XCTAssertTrue(summary.contains("待办"))
+        XCTAssertNil(update.name)
+        XCTAssertNil(update.skillIDs)
+        XCTAssertNil(update.inheritSkills)
+        XCTAssertNil(update.avatar)
     }
 
     private static let fixture = """

@@ -39,6 +39,11 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertNil(old.workDuration)
         XCTAssertNil(old.isGuidance)
         let turns = ChatTurn.collect([old, answer, user, run("1", status: "cancelled")])
+        XCTAssertFalse(turns[0].canContinue)
+        XCTAssertTrue(turns[1].canContinue)
+        var completed = user
+        completed.interrupted = false
+        XCTAssertFalse(ChatTurn.collect([completed, run("1", status: "cancelled")])[0].canContinue)
         XCTAssertEqual(Array(turns[0].presentation(running: false).reply), [answer])
         XCTAssertEqual(turns[1].presentation(running: false).process.first?.tools.first?.status, "cancelled")
         XCTAssertTrue(turns[1].presentation(running: false).reply.isEmpty)
@@ -228,6 +233,26 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertFalse(original.contains("Queued for the next turn"), original)
     }
 
+    func testGatewayRequestTimesOutWithInheritedOutputOpen() throws {
+        let files = FileManager.default
+        let home = files.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try files.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? files.removeItem(at: home) }
+        let executable = home.appendingPathComponent("hermes")
+        try Data("#!/bin/sh\n/bin/sleep 4 &\nwait\n".utf8).write(to: executable)
+        try files.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runtime = HermesRuntime(executable: executable)
+        let started = ContinuousClock.now
+
+        XCTAssertThrowsError(try runtime.gatewayOperation("pass", request: [:], home: home, timeout: 0.2)) {
+            guard case .timedOut? = $0 as? HermesRuntime.CapturedCommandError else {
+                return XCTFail("应返回网关请求超时，实际为 \($0)。")
+            }
+        }
+        XCTAssertLessThan(started.duration(to: .now), .seconds(2))
+        XCTAssertTrue(try files.contentsOfDirectory(atPath: home.appendingPathComponent("cache").path).isEmpty)
+    }
+
     func testLiveHermesInsertsIntoActiveTurnAndRefusesAfterItEnds() async throws {
         guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
             throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后验证执行中插入。")
@@ -326,6 +351,80 @@ final class ChatTurnTests: XCTestCase {
         XCTAssertEqual(request.edit?.before, "BEFORE")
         XCTAssertEqual(request.edit?.after?.trimmingCharacters(in: .whitespacesAndNewlines), "AFTER")
         XCTAssertEqual(try String(contentsOf: file, encoding: .utf8), "BEFORE")
+    }
+
+    func testLiveWorkspaceAutoApprovesRepeatedEditsOnlyInsideItsScope() async throws {
+        guard ProcessInfo.processInfo.environment["HERMES_STUDIO_LIVE_TEST"] == "1" else {
+            throw XCTSkip("设置 HERMES_STUDIO_LIVE_TEST=1 后实测文件编辑审批范围。")
+        }
+        let runtime = try XCTUnwrap(HermesRuntime.discover())
+        let files = FileManager.default
+        let root = files.homeDirectoryForCurrentUser.appendingPathComponent(".hermes-approval-check-\(UUID())")
+        let store = RoleStore(root: root)
+        let role = Role(name: "自动审批验收", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let home = store.runtime(for: role.id)
+        defer {
+            runtime.reset(home: home)
+            try? files.removeItem(at: root)
+        }
+
+        let project = try store.createProject(name: "自动审批验收", directory: nil, for: role.id)
+        let outside = root.appendingPathComponent("outside-check.txt")
+        let initial = try await runtime.runSettings(home: home, sessionID: nil, workspace: project.directory)
+        let choices = try XCTUnwrap(initial.settings?.editApproval?.choices.map(\.id))
+        let workspaceMode = try XCTUnwrap(choices.first { ["workspace_session", "accept_edits"].contains($0) })
+        let sessionMode = try XCTUnwrap(choices.first { ["session", "dont_ask"].contains($0) })
+        var conversation = Conversation(roleID: role.id)
+        conversation.sessionID = initial.id
+
+        func edit(_ prompt: String) async throws -> [ToolPermission] {
+            let control = TurnControl()
+            let timeout = Task {
+                do { try await Task.sleep(for: .seconds(80)) } catch { return }
+                control.cancel()
+            }
+            defer { timeout.cancel() }
+            var prompts: [ToolPermission] = []
+            for await event in runtime.turn(home: home, conversation: conversation, text: prompt,
+                workspace: project.directory, interactive: true, control: control) {
+                switch event {
+                case .permission(let request):
+                    prompts.append(request)
+                    let deny = request.options.first(where: { $0.kind == "reject_once" })
+                    XCTAssertTrue(control.respond(to: request.id, optionID: deny?.id))
+                case .failed(let message): throw StudioError.message(message)
+                case .finished(let reason): XCTAssertEqual(reason, "end_turn")
+                default: break
+                }
+            }
+            return prompts
+        }
+
+        let automatic = try await runtime.runSettings(home: home, sessionID: initial.id,
+            workspace: project.directory, change: (.editApproval, workspaceMode))
+        XCTAssertEqual(automatic.settings?.editApproval?.value, workspaceMode)
+        let requests = try await edit("""
+            这是隔离的审批测试。请只用 write_file 工具按顺序创建三份新文件，内容都为 TEST：
+            ./first.txt、./second.txt、\(outside.path)。
+            每个文件只调用一次 write_file。遇到拒绝立即停止，不要改用其他工具。
+            """)
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.edit?.path, outside.path)
+        XCTAssertEqual(Set(requests.first?.options.map(\.id) ?? []), ["allow_once", "deny"])
+        for name in ["first.txt", "second.txt"] {
+            let value = try String(contentsOf: project.directory.appendingPathComponent(name), encoding: .utf8)
+            XCTAssertEqual(value.trimmingCharacters(in: .whitespacesAndNewlines), "TEST")
+        }
+        XCTAssertFalse(files.fileExists(atPath: outside.path))
+
+        let relaxed = try await runtime.runSettings(home: home, sessionID: initial.id,
+            workspace: project.directory, change: (.editApproval, sessionMode))
+        XCTAssertEqual(relaxed.settings?.editApproval?.value, sessionMode)
+        let next = try await edit("只调用一次 write_file，在 \(outside.path) 写入 ALLOWED。这个文件是本次测试的临时文件。")
+        XCTAssertTrue(next.isEmpty)
+        XCTAssertEqual(try String(contentsOf: outside, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), "ALLOWED")
     }
 
     private func run(_ id: String, status: String) -> Message {
