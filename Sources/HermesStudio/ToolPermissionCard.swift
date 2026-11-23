@@ -9,6 +9,9 @@ struct ToolPermissionCard: View {
     let stop: () -> Void
     let respond: (String) -> Void
     @State private var showsOtherOptions = false
+    @State private var clarificationHeight: CGFloat?
+
+    private let maximumClarificationHeight: CGFloat = 178
 
     private var isClarification: Bool { permission.kind == "clarify" }
 
@@ -81,11 +84,12 @@ struct ToolPermissionCard: View {
             .padding(.vertical, 10)
 
             if isClarification && !clarificationOptions.isEmpty {
-                ViewThatFits(in: .vertical) {
-                    clarificationList.fixedSize(horizontal: false, vertical: true)
-                    ScrollView { clarificationList }
+                ScrollView {
+                    clarificationList
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { clarificationHeight = $0 }
                 }
-                .frame(maxHeight: 178)
+                .scrollBounceBehavior(.basedOnSize)
+                .frame(height: min(clarificationHeight ?? maximumClarificationHeight, maximumClarificationHeight))
                 .padding(.horizontal, 7)
                 .padding(.bottom, 5)
             }
