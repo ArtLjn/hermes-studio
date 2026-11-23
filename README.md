@@ -11,10 +11,10 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.7-4C5FD5?style=flat-square" alt="v0.4.7">
+  <img src="https://img.shields.io/badge/version-0.4.11-4C5FD5?style=flat-square" alt="v0.4.11">
   <img src="https://img.shields.io/badge/Swift-5.10-F05138?style=flat-square" alt="Swift 5.10">
   <img src="https://img.shields.io/badge/macOS-14%2B-1F6FEB?style=flat-square" alt="macOS 14+">
-  <img src="https://img.shields.io/badge/tests-30%20%E6%9C%AC%E5%9C%B0%20%2B%2012%20%E8%81%94%E8%B0%83-2E7D32?style=flat-square" alt="30 local + 12 live tests">
+  <img src="https://img.shields.io/badge/tests-99%20%E6%9C%AC%E5%9C%B0%20%2B%2036%20%E8%81%94%E8%B0%83-2E7D32?style=flat-square" alt="99 local + 36 live tests">
   <img src="https://img.shields.io/badge/local--first-仅本机运行-64748B?style=flat-square" alt="Local first">
 </p>
 
@@ -260,8 +260,8 @@ HERMES_STUDIO_LIVE_TEST=1 swift test
 HERMES_STUDIO_VISION_TEST=1 swift test --filter testLiveHermesAcceptsImageInput
 ```
 
-- 默认运行 **42 项测试，30 项实跑通过、12 项跳过**（跳过的是需要真实模型与已配置 Hermes 的联调用例），0 失败。
-- 覆盖了角色与会话的隔离与重开、项目目录创建与关联、数据目录迁移、置顶归档状态、回合内补话、运行设置映射、Markdown 流式分块、更新版本比较和输入编辑器行为。
+- 默认运行 **135 项测试，99 项实跑通过、36 项跳过**（跳过的是需要真实模型、内置 MCP 程序或界面截图的联调用例），0 失败。
+- 覆盖了角色与会话的隔离与重开、项目目录创建与关联、数据目录迁移、置顶归档状态、回合内补话、运行设置映射、Markdown 流式分块、更新版本比较和输入编辑器行为，以及群聊接话与生成预算、MCP 作用域与连通性、角色目录工具与交接回执。
 - 设 `HERMES_STUDIO_LIVE_TEST=1` 后，联调用例改用本机已配置的模型，验证技能调用、记忆隔离、项目会话恢复和工具调用；`HERMES_STUDIO_VISION_TEST=1` 会发送一张生成的纯色样图测图片输入。
 - 涉及 Hermes 进程行为的断言在默认模式下用替身（临时目录 + 假的可执行文件）完成，只有打开环境变量才走真机。
 
