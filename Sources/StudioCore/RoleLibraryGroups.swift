@@ -72,6 +72,23 @@ extension RoleStore {
         }
     }
 
+    public func renameLibraryGroup(_ currentName: String, to input: String) throws -> String {
+        guard let name = try libraryGroupName(input) else { throw StudioError.message("请输入分组名。") }
+        return try editLibraryCatalog { catalog in
+            guard let index = catalog.groups.firstIndex(where: { $0.name == currentName }) else {
+                throw StudioError.message("原分组已不存在，请重新选择。")
+            }
+            let group = catalog.groups[index]
+            guard !catalog.groups.contains(where: {
+                $0.id != group.id && $0.name.localizedCaseInsensitiveCompare(name) == .orderedSame
+            }) else {
+                throw StudioError.message("「\(name)」分组已存在。")
+            }
+            catalog.groups[index] = RoleLibraryGroup(id: group.id, name: name)
+            return name
+        }
+    }
+
     @discardableResult
     public func reorderLibraryGroup(_ name: String, to target: String) throws -> Bool {
         try editLibraryCatalog { catalog in

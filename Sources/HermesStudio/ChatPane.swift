@@ -134,9 +134,16 @@ struct ChatPane: View {
     private func transcriptRow(_ turn: ChatTurn, roleID: UUID, isLast: Bool) -> some View {
         let liveText = studio.consultationText(for: turn.id)
         let active = studio.isConsultingHere ? liveText != nil : isLast
+        let restoreRequest: (() -> Void)? = turn.canRestoreRequest ? {
+            if studio.restoreUnansweredMessage(turn.id) {
+                composerFocused = true
+                composerFocusRequest = UUID()
+            }
+        } : nil
         return VStack(alignment: .leading, spacing: 10) {
             ChatTurnRow(turn: turn, role: studio.role, store: studio.store, roleID: roleID,
-                activity: active ? studio.activity : nil)
+                activity: active ? studio.activity : nil, restoreRequest: restoreRequest,
+                canRestoreRequest: studio.canRestoreMessage)
             if let request = turn.request, let handoff = request.handoff, request.id != pinnedHandoff?.id {
                 RoleHandoffCard(studio: studio, request: request, handoff: handoff,
                     preparing: studio.isPreparingHandoff && isLast, review: { handoffReview = $0 })

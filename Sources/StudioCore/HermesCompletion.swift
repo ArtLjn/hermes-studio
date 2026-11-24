@@ -12,9 +12,11 @@ public struct HermesCompletion: Identifiable, Equatable, Sendable {
     public var id: String { text }
 
     // ACP 支持的命令少于 TUI，补全结果只展示能在当前聊天入口执行的命令。
-    fileprivate static let acpCommands: Set<String> = [
+    private static let acpCommands: Set<String> = [
         "help", "model", "tools", "context", "reset", "compress", "steer", "queue", "version"
     ]
+
+    public static func supportsACPCommand(_ name: String) -> Bool { acpCommands.contains(name) }
 
     public static func reference(at caret: Int, in text: String) -> (word: String, range: NSRange)? {
         let source = text as NSString
@@ -75,7 +77,7 @@ final class HermesCompletionWorker: @unchecked Sendable {
                 switch query {
                 case .slash:
                     let name = value.hasPrefix("/") ? String(value.dropFirst()) : value
-                    guard item["kind"] as? String != "skill", HermesCompletion.acpCommands.contains(name) else {
+                    guard item["kind"] as? String != "skill", HermesCompletion.supportsACPCommand(name) else {
                         return nil
                     }
                     text = "/" + name

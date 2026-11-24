@@ -48,6 +48,42 @@ final class StudioCoreTests: XCTestCase {
         XCTAssertEqual(try reopened.file(.memory, for: active.id), "原记忆")
         XCTAssertEqual(try reopened.conversations(for: active.id).first?.messages, thread.messages)
     }
+
+    func testRoleLibraryRenameKeepsLegacyMembersAndRejectsDuplicateNames() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        var active = Role(name: "柚子", summary: "", template: .blank)
+        var archived = Role(name: "糖糖", summary: "", template: .blank)
+        try store.create(active, instructions: "原始角色指令")
+        try store.create(archived, instructions: "")
+        active.libraryGroup = "旧分组"
+        archived.libraryGroup = "旧分组"
+        archived.archivedAt = Date()
+        for role in [active, archived] {
+            let record = store.roleDirectory(role.id).appendingPathComponent("role.json")
+            try JSONEncoder().encode(role).write(to: record, options: .atomic)
+        }
+
+        XCTAssertEqual(try store.renameLibraryGroup("旧分组", to: " 日常协作 "), "日常协作")
+        let memberID = try XCTUnwrap(store.list().first?.libraryGroupID)
+        XCTAssertEqual(try store.archivedRoles().first?.libraryGroupID, memberID)
+        try store.createLibraryGroup("Work")
+        for invalid in ["  ", "未分组", "work", "多行\n名称"] {
+            XCTAssertThrowsError(try store.renameLibraryGroup("日常协作", to: invalid))
+        }
+        XCTAssertThrowsError(try store.renameLibraryGroup("不存在", to: "新分组"))
+        XCTAssertEqual(try store.renameLibraryGroup("Work", to: "WORK"), "WORK")
+        try store.createLibraryGroup("旧分组")
+
+        let reopened = RoleStore(root: root)
+        XCTAssertEqual(try reopened.libraryGroups(), ["日常协作", "WORK", "旧分组"])
+        XCTAssertEqual(try reopened.list().first?.libraryGroup, "日常协作")
+        XCTAssertEqual(try reopened.restore(archived.id).libraryGroup, "日常协作")
+        XCTAssertEqual(try reopened.list().first?.libraryGroupID, memberID)
+        XCTAssertEqual(try reopened.file(.soul, for: active.id), "原始角色指令")
+    }
+
     func testGatewayRepairDiscardsOnlyTheDeadOwnerPointerFromTheOldHome() throws {
         let files = FileManager.default
         let parent = files.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -579,7 +615,7 @@ final class StudioCoreTests: XCTestCase {
                 tools[tool.id] = updated
                 onTool(updated)
             case .activity, .image, .permission, .permissionExpired, .followUpReady, .followUpStarted, .followUpRejected,
-                .runSettings, .insertionAccepted, .insertionFailed: break
+                .runSettings, .insertionReady, .insertionAccepted, .insertionDeferred, .insertionFailed: break
             }
         }
         return (sessionID, reply)

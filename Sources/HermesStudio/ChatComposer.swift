@@ -44,12 +44,16 @@ struct ChatComposer: View {
 
     private var activeToken: Token? { token == dismissedToken ? nil : token }
 
+    private var skillSearchRoleID: UUID? {
+        guard case .skill = activeToken else { return nil }
+        return studio.roleID
+    }
+
     private var nativeRequest: NativeRequest? {
         guard studio.available, let roleID = studio.roleID, let token = activeToken else { return nil }
         switch token {
         case .skill(let command):
-            guard command.range.location == 0,
-                (studio.draft as NSString).substring(with: command.range) == "/" + command.query else { return nil }
+            guard !command.isExplicit, command.range.location == 0 else { return nil }
             return NativeRequest(roleID: roleID, query: .slash("/" + command.query))
         case .reference(let word, _):
             guard let project = studio.project else { return nil }
@@ -101,6 +105,10 @@ struct ChatComposer: View {
         .onChange(of: token) { _, _ in
             highlighted = 0
             dismissedToken = nil
+        }
+        .task(id: skillSearchRoleID) {
+            guard skillSearchRoleID != nil, !Task.isCancelled else { return }
+            await studio.refreshSkillCatalog()
         }
         .task(id: request) {
             guard let request else { return }
@@ -203,7 +211,15 @@ struct ChatComposer: View {
                 return true
             }
             guard key == .send else { return false }
-            if case .skill(let command) = token, command.query.isEmpty { return true }
+            if case .skill(let command) = token {
+                guard !command.query.isEmpty else { return true }
+                if !command.isExplicit, command.range.location == 0, HermesCompletion.supportsACPCommand(command.query) {
+                    studio.send()
+                } else {
+                    finishSkillSearch(command)
+                }
+                return true
+            }
             studio.send()
             return true
         case .up, .down:
@@ -214,6 +230,23 @@ struct ChatComposer: View {
         case .dismiss:
             dismissedToken = token
             return true
+        }
+    }
+
+    private func finishSkillSearch(_ command: SkillCommand) {
+        let draft = studio.draft
+        let context = studio.runSettingsContext
+        Task {
+            await studio.refreshSkillCatalog()
+            guard studio.draft == draft, studio.runSettingsContext == context,
+                activeToken == .skill(command) else { return }
+            if let match = choices(for: .skill(command)).first {
+                select(match, for: .skill(command))
+            } else if command.isExplicit {
+                studio.error = "没有找到匹配的技能，或当前角色未启用该技能。"
+            } else {
+                studio.send()
+            }
         }
     }
 
@@ -392,7 +425,8 @@ struct ChatComposer: View {
                     .disabled(studio.isStoppingHere)
             }
             if studio.canContinueReply {
-                replyControl("继续", label: "继续回复", symbol: "play.fill",
+                let title = studio.hasUnsentReply ? "重试原消息" : "继续回复"
+                replyControl(studio.hasUnsentReply ? title : "继续", label: title, symbol: "play.fill",
                     help: "在当前会话中重试上次中断的请求", action: studio.continueReply)
             } else if !studio.isGeneratingHere || studio.canSend {
                 let collaboration = studio.selectedHandoffTargetID.map { _ in studio.collaborationMode }

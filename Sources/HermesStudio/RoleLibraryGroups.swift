@@ -44,6 +44,7 @@ struct RoleLibraryGroupBar: View {
     let groups: [String]
     @Binding var selection: RoleLibraryFilter
     let create: () -> Void
+    let rename: (String) -> Void
     let receive: (RoleLibraryDrag, String?) -> Bool
 
     var body: some View {
@@ -60,6 +61,9 @@ struct RoleLibraryGroupBar: View {
                             .draggable(RoleLibraryDrag.group(group))
                             .help("\(group) · 点击筛选，拖动排序")
                             .modifier(RoleLibraryDropZone(group: group, receive: receive))
+                            .contextMenu {
+                                Button("重命名分组", systemImage: "pencil") { rename(group) }
+                            }
                     }
                     filter(.ungrouped, symbol: "tray")
                         .modifier(RoleLibraryDropZone(group: nil, receive: receive))
@@ -92,25 +96,36 @@ struct RoleLibraryGroupBar: View {
     }
 }
 
-struct NewRoleLibraryGroup: View {
-    let create: (String) throws -> Void
+struct RoleLibraryGroupEditor: View {
+    let group: String?
+    let save: (String) throws -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
+    @State private var name: String
     @State private var error: String?
+    @FocusState private var nameFocused: Bool
+
+    init(group: String? = nil, save: @escaping (String) throws -> Void) {
+        self.group = group
+        self.save = save
+        _name = State(initialValue: group ?? "")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("新建分组").font(.system(size: 18, weight: .semibold)).accessibilityAddTraits(.isHeader)
+            Text(group == nil ? "新建分组" : "重命名分组")
+                .font(.system(size: 18, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
             TextField("例如：工作协作", text: $name)
                 .textFieldStyle(.roundedBorder)
                 .accessibilityLabel("分组名称")
+                .focused($nameFocused)
             if let error { Text(error).font(.system(size: 12)).foregroundStyle(StudioPalette.accent) }
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("创建") {
+                Button(group == nil ? "创建" : "保存") {
                     do {
-                        try create(name)
+                        try save(name)
                         dismiss()
                     } catch { self.error = error.localizedDescription }
                 }
@@ -118,6 +133,7 @@ struct NewRoleLibraryGroup: View {
                 .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
+        .defaultFocus($nameFocused, true)
         .padding(20)
         .frame(width: 340)
     }

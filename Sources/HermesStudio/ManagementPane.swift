@@ -67,6 +67,12 @@ enum RoleLibraryFilter: Equatable {
 }
 
 struct ManagementPane: View {
+    private enum LibraryGroupEdit: Hashable, Identifiable {
+        case create, rename(String)
+
+        var id: Self { self }
+    }
+
     @ObservedObject var studio: StudioModel
     @Binding var page: ManagementPage
     let toolbarLeading: CGFloat
@@ -81,7 +87,7 @@ struct ManagementPane: View {
     @State private var visibleConversationCount = ConversationBatch.size
     @State private var pinnedOnly = false
     @State private var libraryFilter: RoleLibraryFilter = .all
-    @State private var creatingLibraryGroup = false
+    @State private var editingLibraryGroup: LibraryGroupEdit?
     @State private var dissolvingLibraryGroup: String?
     @State private var previewingArchive: UUID?
     @FocusState private var searchFocused: Bool
@@ -111,19 +117,6 @@ struct ManagementPane: View {
         if query.isEmpty { return studio.recentThreads }
         let matchingIDs = Set(studio.roles.filter { $0.name.localizedCaseInsensitiveContains(query) }.map(\.id))
         return studio.recentThreads.filter { $0.title.localizedCaseInsensitiveContains(query) || matchingIDs.contains($0.roleID) }
-    }
-
-    private var visibleThreads: ArraySlice<Conversation> {
-        matchingThreads.prefix(visibleConversationCount)
-    }
-
-    private var hasMoreConversations: Bool {
-        visibleThreads.count < matchingThreads.count
-    }
-
-    private func loadMoreConversations() {
-        visibleConversationCount = ConversationBatch.nextVisibleCount(
-            current: visibleConversationCount, total: matchingThreads.count)
     }
 
     private var archivedPage: some View {
@@ -276,7 +269,8 @@ struct ManagementPane: View {
                 searchBox("搜索角色", query: $roleQuery)
             }
             RoleLibraryGroupBar(groups: libraryGroups, selection: $libraryFilter,
-                create: { creatingLibraryGroup = true }, receive: dropLibraryItem)
+                create: { editingLibraryGroup = .create }, rename: { editingLibraryGroup = .rename($0) },
+                receive: dropLibraryItem)
             let query = roleQuery.trimmingCharacters(in: .whitespacesAndNewlines)
             let terminalGroup = studio.terminalHome.flatMap { studio.linkedTerminalRole(for: $0)?.libraryGroup }
             let terminal = pinnedOnly ? nil : studio.terminalHome.flatMap { home in
@@ -294,12 +288,20 @@ struct ManagementPane: View {
                     showsEmptyGroups: query.isEmpty && !pinnedOnly)
             }
         }
-        .sheet(isPresented: $creatingLibraryGroup) {
-            NewRoleLibraryGroup { name in
-                _ = try studio.createLibraryGroup(name)
-                libraryFilter = .all
-                pinnedOnly = false
-                roleQuery = ""
+        .sheet(item: $editingLibraryGroup) { operation in
+            switch operation {
+            case .create:
+                RoleLibraryGroupEditor { name in
+                    _ = try studio.createLibraryGroup(name)
+                    libraryFilter = .all
+                    pinnedOnly = false
+                    roleQuery = ""
+                }
+            case .rename(let group):
+                RoleLibraryGroupEditor(group: group) { name in
+                    let renamed = try studio.renameLibraryGroup(group, to: name)
+                    if libraryFilter == .group(group) { libraryFilter = .group(renamed) }
+                }
             }
         }
         .alert("解散分组", isPresented: Binding(get: { dissolvingLibraryGroup != nil },
@@ -378,6 +380,7 @@ struct ManagementPane: View {
     private func libraryGroupActions(_ group: String) -> some View {
         let index = libraryGroups.firstIndex(of: group)
         return Menu {
+            Button("重命名分组", systemImage: "pencil") { editingLibraryGroup = .rename(group) }
             Button("上移", systemImage: "arrow.up") {
                 if let index, index > 0 { studio.reorderLibraryGroup(group, to: libraryGroups[index - 1]) }
             }
@@ -407,38 +410,35 @@ struct ManagementPane: View {
     }
 
     private var conversationList: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        let threads = matchingThreads
+        let visible = threads.prefix(visibleConversationCount)
+        return VStack(alignment: .leading, spacing: 16) {
             pageTitle("对话记录", subtitle: "按角色名称或对话标题查找历史会话。", addRole: false)
             HStack {
-                sectionTitle("全部对话", count: matchingThreads.count)
+                sectionTitle("全部对话", count: threads.count)
                 Spacer()
                 searchBox("搜索对话或角色", query: $conversationQuery)
                 Button("已归档", systemImage: "archivebox") { navigate(.archivedChats) }
                     .buttonStyle(QuietButton())
                     .fixedSize()
             }
-            if matchingThreads.isEmpty {
+            if threads.isEmpty {
                 emptyState(conversationQuery.isEmpty ? "还没有对话记录" : "没有匹配的对话", icon: "bubble.left.and.bubble.right")
             } else {
-                LazyVStack(spacing: 0) {
-                    ForEach(visibleThreads) { thread in
+                VStack(spacing: 0) {
+                    ForEach(visible) { thread in
                         if let role = role(for: thread) {
                             WorkspaceConversationRow(thread: thread, role: role, studio: studio)
                             StudioRule()
                         }
                     }
-                    if hasMoreConversations {
-                        HStack(spacing: 8) {
-                            ProgressView()
-                                .controlSize(.small)
-                                .accessibilityHidden(true)
-                            Text("正在加载更多对话")
-                                .font(.system(size: 11))
-                                .foregroundStyle(StudioPalette.muted)
+                    if visible.count < threads.count {
+                        Button("显示更多对话", systemImage: "chevron.down") {
+                            visibleConversationCount = ConversationBatch.nextVisibleCount(
+                                current: visibleConversationCount, total: threads.count)
                         }
+                        .buttonStyle(QuietButton())
                         .frame(maxWidth: .infinity, minHeight: 36)
-                        .id(visibleConversationCount)
-                        .onAppear(perform: loadMoreConversations)
                     }
                 }
             }

@@ -12,7 +12,9 @@ public enum TurnEvent: Sendable {
     case followUpReady
     case followUpStarted(UUID)
     case followUpRejected(UUID)
+    case insertionReady
     case insertionAccepted(UUID, String)
+    case insertionDeferred(UUID)
     case insertionFailed(UUID, String)
     case activity(String)
     case finished(String)
@@ -30,7 +32,8 @@ public final class TurnControl: @unchecked Sendable {
     private var submitFollowUp: ((UUID, String) throws -> Void)?
     private var acceptsFollowUps = false
     private var followUp: (id: UUID, text: String, started: Bool, acknowledged: Bool)?
-    private var sendInsertion: ((UUID, String) -> Void)?
+    private var sendInsertion: ((UUID, String, @escaping () -> Void) -> Void)?
+    private let pendingInsertions = DispatchGroup()
     private var permissions: [UUID: (ToolPermission, (String?) throws -> Void)] = [:]
 
     public init() {}
@@ -104,14 +107,20 @@ public final class TurnControl: @unchecked Sendable {
 
     public func insert(id: UUID, text: String) -> Bool {
         lock.withLock {
-            guard !cancelled, permissions.isEmpty, let sendInsertion else { return false }
-            sendInsertion(id, text)
+            guard !cancelled, promptStarted, permissions.isEmpty, let sendInsertion else { return false }
+            let pending = pendingInsertions
+            pending.enter()
+            sendInsertion(id, text) { pending.leave() }
             return true
         }
     }
 
-    fileprivate func handleInsertion(_ handler: @escaping (UUID, String) -> Void) {
+    fileprivate func handleInsertion(_ handler: @escaping (UUID, String, @escaping () -> Void) -> Void) {
         lock.withLock { sendInsertion = handler }
+    }
+
+    fileprivate func afterInsertions(_ finish: @escaping @Sendable () -> Void) {
+        pendingInsertions.notify(queue: .global(qos: .userInitiated), execute: finish)
     }
 
     public func respond(to id: UUID, optionID: String?) -> Bool {
@@ -200,6 +209,8 @@ public final class TurnControl: @unchecked Sendable {
         defer { lock.unlock() }
         return cancelled
     }
+
+    public var hasStartedPrompt: Bool { lock.withLock { promptStarted } }
 }
 
 extension HermesRuntime {
@@ -349,15 +360,19 @@ extension HermesRuntime {
                 }
             } completion: { result in
                 groupStart?.release()
-                defer { stream.finish() }
-                switch result {
-                case .success(let reason): stream.yield(.finished(reason))
-                case .failure where control.awaitingStopConfirmation:
-                    stream.yield(.failed("Hermes 尚未确认本次任务停止，已关闭本地回复连接。"))
-                case .failure where control.isCancelled:
-                    stream.yield(.finished("cancelled"))
-                case .failure(let error): stream.yield(.failed(error.localizedDescription))
+                let finish: @Sendable () -> Void = {
+                    defer { stream.finish() }
+                    switch result {
+                    case .success(let reason): stream.yield(.finished(reason))
+                    case .failure where control.awaitingStopConfirmation:
+                        stream.yield(.failed("Hermes 尚未确认本次任务停止，已关闭本地回复连接。"))
+                    case .failure where control.isCancelled:
+                        stream.yield(.finished("cancelled"))
+                    case .failure(let error): stream.yield(.failed(error.localizedDescription))
+                    }
                 }
+                if interactive { control.afterInsertions(finish) }
+                else { finish() }
             }
         }
     }
@@ -374,11 +389,14 @@ extension HermesRuntime {
         if control.isCancelled { throw CancellationError() }
         if interactive, let settings = worker.rpc.settings[sessionID] { receive(.runSettings(settings)) }
         if interactive {
-            control.handleInsertion { id, text in
+            control.handleInsertion { id, text, finish in
                 Task {
+                    defer { finish() }
                     do {
                         try await insertIntoRunningTurn(text, sessionID: sessionID, home: home)
                         receive(.insertionAccepted(id, text))
+                    } catch let error as HermesInsertionError where error != .unconfirmed {
+                        receive(.insertionDeferred(id))
                     } catch {
                         receive(.insertionFailed(id, error.localizedDescription))
                     }
@@ -403,6 +421,7 @@ extension HermesRuntime {
             if control.isCancelled { throw CancellationError() }
         }
         receive(.activity("等待模型回复"))
+        var reportedInsertionReady = false
         let response = try worker.rpc.call("session/prompt", parameters: [
             "sessionId": sessionID,
             "prompt": prompt
@@ -434,6 +453,11 @@ extension HermesRuntime {
                 receive(.runSettings(settings))
             } else if kind == "agent_thought_chunk" {
                 receive(.activity("正在思考"))
+            }
+            if interactive, !reportedInsertionReady, let kind,
+                ["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"].contains(kind) {
+                reportedInsertionReady = true
+                receive(.insertionReady)
             }
         }
         return response["stopReason"] as? String ?? "end_turn"
@@ -935,6 +959,11 @@ private final class ACPWorker {
 }
 
 final class ACPConnection {
+    static func requestTimeout(for method: String) -> DispatchTimeInterval {
+        // 建立或恢复会话会等待本机网关启动，普通控制请求保留原有超时。
+        method == "session/new" || method == "session/load" ? .seconds(90) : .seconds(30)
+    }
+
     let input: FileHandle
     let output: FileHandle
     var buffer = Data()
@@ -961,7 +990,7 @@ final class ACPConnection {
     }
 
     func call(
-        _ method: String, parameters: [String: Any], timeout: DispatchTimeInterval = .seconds(30),
+        _ method: String, parameters: [String: Any], timeout: DispatchTimeInterval? = nil,
         control: TurnControl? = nil, cancellation: TurnControl? = nil,
         onPermission: (ToolPermission) -> Void = { _ in },
         onFollowUpReady: () -> Void = {},
@@ -971,7 +1000,7 @@ final class ACPConnection {
     ) throws -> [String: Any] {
         nextID += 1
         let id = nextID
-        let deadline = method == "session/prompt" ? nil : DispatchTime.now() + timeout
+        let deadline = method == "session/prompt" ? nil : DispatchTime.now() + (timeout ?? Self.requestTimeout(for: method))
         let sessionID = parameters["sessionId"] as? String
         let request: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method, "params": parameters]
         if let cancellation, let sessionID {
@@ -997,7 +1026,7 @@ final class ACPConnection {
         var rejectedQueueCommand = false
         let turnUpdates: Set<String> = ["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]
         while true {
-            let event = try read(until: deadline, cancellation: cancellation)
+            let event = try read(method: method, until: deadline, cancellation: cancellation)
             if event["method"] as? String == "session/update",
                 let params = event["params"] as? [String: Any],
                 let update = params["update"] as? [String: Any] {
@@ -1107,7 +1136,7 @@ final class ACPConnection {
         try send(["jsonrpc": "2.0", "id": id, "result": ["outcome": outcome]])
     }
 
-    private func read(until deadline: DispatchTime?, cancellation: TurnControl?) throws -> [String: Any] {
+    private func read(method: String, until deadline: DispatchTime?, cancellation: TurnControl?) throws -> [String: Any] {
         while true {
             if let stopDeadline = cancellation?.stopDeadline, DispatchTime.now() >= stopDeadline {
                 throw CancellationError()
@@ -1123,7 +1152,15 @@ final class ACPConnection {
                     var timeout: Int32 = 100
                     if let deadline {
                         let remaining = Int64(deadline.uptimeNanoseconds) - Int64(DispatchTime.now().uptimeNanoseconds)
-                        guard remaining > 0 else { throw StudioError.message("Hermes 初始化或恢复会话超时，请重试。") }
+                        guard remaining > 0 else {
+                            let message = switch method {
+                            case "initialize": "连接本机 Hermes 超时，请重试。"
+                            case "session/new": "等待 Hermes 建立会话超时，可继续回复以重试原消息。"
+                            case "session/load": "等待 Hermes 恢复会话超时，可继续回复以重试原消息。"
+                            default: "Hermes 操作超时，请重试。"
+                            }
+                            throw StudioError.message(message)
+                        }
                         timeout = Int32(clamping: (remaining + 999_999) / 1_000_000)
                     }
                     var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)

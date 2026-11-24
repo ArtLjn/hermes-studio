@@ -12,6 +12,11 @@ public struct ChatTurn: Identifiable {
         return messages.last?.tool?.status == "cancelled"
     }
 
+    public var canRestoreRequest: Bool {
+        guard let request, request.handoff == nil, request.consultation == nil else { return false }
+        return messages.isEmpty
+    }
+
     public struct Activity: Identifiable {
         public let messages: [Message]
         public let tools: [ToolRun]

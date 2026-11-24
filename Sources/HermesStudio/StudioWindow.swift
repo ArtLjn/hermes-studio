@@ -117,6 +117,8 @@ struct StudioWindow: View {
                 railButton("新对话", symbol: "square.and.pencil", action: studio.newConversation)
                 if let role = studio.role {
                     RolePickerButton(roles: studio.roles, selected: role, store: studio.store, compact: true,
+                        runningConversations: studio.runningConversations, selectedConversationID: studio.conversationID,
+                        openRunningConversation: { studio.openConversation($0.id, roleID: $0.role.id) },
                         select: studio.select as (Role) -> Void)
                 }
             }

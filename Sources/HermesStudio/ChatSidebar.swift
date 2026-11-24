@@ -38,6 +38,9 @@ struct ChatSidebar: View {
     private var matchingThreads: [Conversation] { studio.threads.filter { $0.title.localizedCaseInsensitiveContains(searchTerm) } }
 
     var body: some View {
+        let running = studio.runningConversations
+        let pinned = studio.pinnedThreads
+        let recent = self.recent
         VStack(alignment: .leading, spacing: 0) {
             sidebarHeading
 
@@ -54,18 +57,27 @@ struct ChatSidebar: View {
 
             if let role = studio.role {
                 RolePickerButton(roles: studio.roles, selected: role, store: studio.store,
+                    runningConversations: running,
                     select: studio.select as (Role) -> Void)
                     .padding(.horizontal, 16)
                     .padding(.top, 2)
                     .padding(.bottom, 10)
             }
 
+            if !running.isEmpty {
+                RunningConversationList(conversations: running, selectedID: studio.conversationID, store: studio.store) {
+                    studio.openConversation($0.id, roleID: $0.role.id)
+                }
+                .padding(.horizontal, 8)
+                .padding(.bottom, 8)
+            }
+
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
+                VStack(alignment: .leading, spacing: 2) {
                     if searchTerm.isEmpty {
-                        if !studio.pinnedThreads.isEmpty {
+                        if !pinned.isEmpty {
                             sectionHeader("已置顶") { EmptyView() }
-                            ForEach(studio.pinnedThreads) { thread in threadRow(thread) }
+                            ForEach(pinned) { thread in threadRow(thread) }
                         }
 
                         sectionHeader("项目", expanded: $projectsVisible) {
@@ -76,7 +88,7 @@ struct ChatSidebar: View {
                                 }
                             }
                         }
-                        .padding(.top, studio.pinnedThreads.isEmpty ? 0 : 9)
+                        .padding(.top, pinned.isEmpty ? 0 : 9)
                         if projectsVisible {
                             ForEach(studio.projects) { project in projectGroup(project) }
                         }
@@ -266,7 +278,7 @@ struct ChatSidebar: View {
     @ViewBuilder
     private func threadRow(_ thread: Conversation, nested: Bool = false) -> some View {
         let selected = studio.conversationID == thread.id
-        let running = studio.isGenerating(thread.id)
+        let status = studio.runningConversationStatus(thread.id)
         let destinations = studio.projects.filter { $0.id != thread.projectID }
         let row = SidebarEntry(selected: selected) {
             studio.select(thread)
@@ -277,10 +289,12 @@ struct ChatSidebar: View {
                 .lineLimit(1)
                 .padding(.leading, nested ? 32 : 8)
         } accessory: { hovered in
-            if running {
-                ProgressView().controlSize(.mini)
+            if let status {
+                ConversationActivityIndicator(awaitingApproval: status == .awaitingApproval)
                     .frame(width: 24, height: 24)
-                    .accessibilityLabel("正在回复")
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(status.label)
+                    .help(status.label)
             } else if hovered {
                 StudioIconButton(title: thread.pinnedAt == nil ? "置顶对话" : "取消置顶",
                     symbol: thread.pinnedAt == nil ? "pin" : "pin.slash") { studio.toggleConversationPin(thread) }
@@ -289,7 +303,7 @@ struct ChatSidebar: View {
                 }
             }
         }
-        if running {
+        if status != nil {
             row
         } else {
             row

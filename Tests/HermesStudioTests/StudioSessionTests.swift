@@ -791,6 +791,120 @@ final class StudioSessionTests: XCTestCase {
     }
 
     @MainActor
+    func testRunningConversationShortcutsTrackAndOpenSessionsAcrossRoles() async throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("模拟 ACP 需要系统 Python。")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let firstRole = Role(name: "黄小米", summary: "", template: .blank)
+        let secondRole = Role(name: "服小满", summary: "", template: .blank)
+        for role in [firstRole, secondRole] { try store.create(role, instructions: "") }
+        let project = try store.createProject(name: "项目会话", directory: nil, for: firstRole.id)
+        let executable = root.appendingPathComponent("mock-hermes")
+        try Data(Self.fixture.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runtime = HermesRuntime(executable: executable)
+        defer {
+            for role in [firstRole, secondRole] { runtime.reset(home: store.runtime(for: role.id)) }
+        }
+        let studio = StudioModel(dataStore: store, runtime: runtime, runPreferences: .init())
+        XCTAssertTrue(studio.runningConversations.isEmpty)
+
+        studio.select(firstRole)
+        studio.newConversation(in: project)
+        studio.draft = "甲"
+        studio.send()
+        let first = try XCTUnwrap(studio.conversation)
+        XCTAssertEqual(studio.runningConversations.map(\.status), [.running])
+        studio.draft = "甲的草稿"
+        studio.newConversation()
+
+        studio.select(secondRole)
+        studio.draft = "乙"
+        studio.send()
+        let second = try XCTUnwrap(studio.conversation)
+        studio.draft = "乙的草稿"
+        XCTAssertEqual(studio.runningConversations.map(\.id), [first.id, second.id])
+        XCTAssertEqual(studio.runningConversations.map(\.title), [first.title, second.title])
+        XCTAssertEqual(studio.runningConversations.map(\.role.id), [firstRole.id, secondRole.id])
+        try await waitUntil { studio.runningConversations.map(\.status) == [.awaitingApproval, .awaitingApproval] }
+
+        XCTAssertFalse(studio.openConversation(first.id, roleID: secondRole.id))
+        XCTAssertEqual(studio.conversationID, second.id)
+        XCTAssertTrue(studio.openConversation(first.id, roleID: firstRole.id))
+        XCTAssertEqual(studio.conversationID, first.id)
+        XCTAssertEqual(studio.projectID, project.id)
+        XCTAssertEqual(studio.draft, "甲的草稿")
+        studio.stop()
+        XCTAssertEqual(studio.runningConversations.map(\.status), [.stopping, .awaitingApproval])
+        try await waitUntil { studio.runningConversations.map(\.id) == [second.id] }
+
+        XCTAssertTrue(studio.openConversation(second.id, roleID: secondRole.id))
+        XCTAssertEqual(studio.conversationID, second.id)
+        XCTAssertEqual(studio.draft, "乙的草稿")
+        studio.respond(to: try XCTUnwrap(studio.activePermission), option: "allow")
+        try await waitUntil { studio.runningConversations.isEmpty }
+        XCTAssertEqual(studio.conversation?.messages.last?.text, "乙开始乙完成")
+    }
+
+    @MainActor
+    func testQueuedTextAutomaticallyInsertsInOrderAndKeepsLateReceipt() async throws {
+        try await withReplyQueueFixture { studio in
+            for message in ["自动插入原任务", "自动插入补充一", "自动插入补充二"] {
+                studio.draft = message
+                studio.send()
+            }
+            try await waitUntil { !studio.isGeneratingHere }
+            let messages = try XCTUnwrap(studio.conversation?.messages)
+            XCTAssertEqual(messages.filter { $0.author == .user }.map(\.text),
+                ["自动插入原任务", "自动插入补充一", "自动插入补充二"])
+            XCTAssertEqual(messages.filter { $0.isGuidance == true }.map(\.text), ["自动插入补充一", "自动插入补充二"])
+            let turns = ChatTurn.collect(messages)
+            XCTAssertEqual(turns.count, 1)
+            XCTAssertEqual(turns.first?.presentation(running: false).reply.map(\.text), ["原任务收到两条补充。"])
+            XCTAssertTrue(studio.queuedMessages.isEmpty)
+            XCTAssertNil(studio.chatError)
+        }
+    }
+
+    @MainActor
+    func testUnconfirmedAutomaticInsertionPausesWithoutSendingAgain() async throws {
+        try await withReplyQueueFixture { studio in
+            studio.draft = "插入回执验证"
+            studio.send()
+            studio.draft = "插入回执不明"
+            studio.send()
+            try await waitUntil { !studio.isGeneratingHere }
+            XCTAssertTrue(studio.isReplyQueuePaused)
+            XCTAssertEqual(studio.queuedMessages.map(\.text), ["插入回执不明"])
+            XCTAssertEqual(studio.conversation?.messages.filter { $0.author == .user }.map(\.text), ["插入回执验证"])
+            XCTAssertTrue(try XCTUnwrap(studio.chatError).contains("未收到 Hermes 的插入确认"))
+        }
+    }
+
+    @MainActor
+    private func withReplyQueueFixture(_ test: (StudioModel) async throws -> Void) async throws {
+        guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else {
+            throw XCTSkip("模拟 ACP 需要系统 Python。")
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "自动插入验证", summary: "", template: .blank)
+        try store.create(role, instructions: "")
+        let executable = root.appendingPathComponent("mock-hermes")
+        try Data(Self.fixture.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runtime = HermesRuntime(executable: executable)
+        defer { runtime.reset(home: store.runtime(for: role.id)) }
+        let studio = StudioModel(dataStore: store, runtime: runtime, runPreferences: .init())
+        studio.select(role)
+        try await test(studio)
+    }
+
+    @MainActor
     func testPrivateReplyQueueSendsInOrderAndPausesWhenStopped() async throws {
         guard FileManager.default.isExecutableFile(atPath: "/usr/bin/python3") else {
             throw XCTSkip("模拟 ACP 需要系统 Python。")
@@ -820,7 +934,7 @@ final class StudioSessionTests: XCTestCase {
         let removed = try XCTUnwrap(studio.queuedMessages.first { $0.text == "移除这条" })
         studio.removeQueuedMessage(removed.id)
         XCTAssertEqual(studio.queuedMessages.map(\.text), ["乙", "待发第二条", "待发第三条"])
-        XCTAssertTrue(studio.canInsertQueuedMessage)
+        XCTAssertFalse(studio.canInsertQueuedMessage)
         let picture = NSImage(size: NSSize(width: 24, height: 24))
         picture.lockFocus()
         NSColor.white.setFill()
@@ -859,6 +973,82 @@ final class StudioSessionTests: XCTestCase {
              "待发图片", "收到待发图片"])
         XCTAssertEqual(studio.conversation?.messages.first { $0.text == "待发图片" }?.images?.count, 1)
         XCTAssertTrue(studio.queuedMessages.isEmpty)
+    }
+
+    @MainActor
+    func testPrivateSessionSetupFailureCanRetryTheOriginalMessage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "会话重试", summary: "", template: .blank)
+        try store.create(role, instructions: "模拟首次会话建立失败")
+        let executable = root.appendingPathComponent("mock-hermes")
+        try Data(Self.fixture.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runtime = HermesRuntime(executable: executable)
+        let studio = StudioModel(dataStore: store, runtime: runtime, runPreferences: .init())
+        studio.select(role)
+        studio.draft = "原始消息"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        XCTAssertTrue(studio.canContinueReply)
+        XCTAssertNil(studio.conversation?.sessionID)
+        XCTAssertEqual(studio.conversation?.messages.map(\.text), ["原始消息"])
+        XCTAssertEqual(try store.conversations(for: role.id).first?.messages.first?.notSent, true)
+
+        studio.draft = "继续"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        XCTAssertNotNil(studio.conversation?.sessionID)
+        XCTAssertEqual(studio.conversation?.messages.filter { $0.author == .user }.map(\.text), ["原始消息"])
+        XCTAssertEqual(studio.conversation?.messages.last?.text, "原始消息完成")
+        XCTAssertNil(try store.conversations(for: role.id).first?.messages.first?.notSent)
+
+        studio.draft = "继续"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        XCTAssertEqual(studio.conversation?.messages.last?.text, "继续完成")
+        await runtime.releaseIdleWorkers()
+    }
+
+    @MainActor
+    func testPrivateFollowUpIncludesUnsentOpeningAndCanRestoreOlderMessage() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RoleStore(root: root)
+        let role = Role(name: "开头恢复", summary: "", template: .blank)
+        try store.create(role, instructions: "模拟首次会话建立失败")
+        let executable = root.appendingPathComponent("mock-hermes")
+        try Data(Self.fixture.utf8).write(to: executable)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        let runtime = HermesRuntime(executable: executable)
+        let studio = StudioModel(dataStore: store, runtime: runtime, runPreferences: .init())
+        studio.select(role)
+        studio.draft = "这是一条未送达的开头"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        let saved = try XCTUnwrap(store.conversations(for: role.id).first)
+        let opening = try XCTUnwrap(saved.messages.first)
+        XCTAssertEqual(opening.notSent, true)
+        studio.select(saved)
+
+        studio.draft = "我开头说了什么"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        XCTAssertEqual(studio.conversation?.messages.last?.text, "模型收到了未送达的开头作为上下文")
+        studio.draft = "下一条普通消息"
+        studio.send()
+        try await waitUntil { !studio.isGeneratingHere }
+        XCTAssertEqual(studio.conversation?.messages.last?.text, "下一条普通消息完成")
+
+        studio.draft = "已有草稿"
+        XCTAssertFalse(studio.restoreUnansweredMessage(opening.id))
+        XCTAssertEqual(studio.draft, "已有草稿")
+        studio.draft = ""
+        XCTAssertTrue(studio.restoreUnansweredMessage(opening.id))
+        XCTAssertEqual(studio.draft, opening.text)
+        XCTAssertEqual(studio.conversation?.messages.first?.id, opening.id)
+        await runtime.releaseIdleWorkers()
     }
 
     @MainActor
@@ -1774,6 +1964,20 @@ final class StudioSessionTests: XCTestCase {
         import json, os, re, select, signal, sys, time, uuid
         from pathlib import Path
 
+        if sys.argv[1:] == ["--run-module", "code", "-q"]:
+            sys.stdin.readline()
+            request = json.loads(sys.stdin.readline())
+            text = request.get("text")
+            if text is not None:
+                outcome = "unavailable"
+                if text in ("自动插入补充一", "自动插入补充二", "插入回执不明"):
+                    (Path(os.environ["HERMES_HOME"]) / text).touch()
+                    outcome = "unconfirmed" if text == "插入回执不明" else "accepted"
+                    if text == "自动插入补充二":
+                        time.sleep(0.35)
+                print("HERMES_STUDIO_GATEWAY=" + outcome)
+            sys.exit(0)
+
         if sys.argv[1:] != ["acp"]:
             fixture_skills = Path(__file__).resolve().parent / "fixture-skills"
             if sys.argv[-1] == "skills" and fixture_skills.is_dir():
@@ -1806,6 +2010,11 @@ final class StudioSessionTests: XCTestCase {
             if method == "session/new":
                 home = Path(os.environ["HERMES_HOME"])
                 soul = home / "SOUL.md"
+                retry = home / "fixture-session-retry"
+                if soul.exists() and "模拟首次会话建立失败" in soul.read_text() and not retry.exists():
+                    retry.touch()
+                    send(id=request["id"], error={"code": -32000, "message": "测试会话未建立"})
+                    continue
                 if soul.exists() and "测试：两个会话同时建立" in soul.read_text() and json.loads((home / "config.yaml").read_text()).get("agent", {}).get("max_turns") != 1:
                     shared = home.parents[2]
                     (shared / ("ready-" + home.parent.name)).touch()
@@ -1827,6 +2036,9 @@ final class StudioSessionTests: XCTestCase {
                     assert name.endswith("studio-send-fixture 获取技能指令。")
                     assert len(params["prompt"]) == 2 and params["prompt"][1]["text"].startswith("回复方式：")
                     update(session, "已收到单独发送的技能")
+                elif name.startswith("我开头说了什么"):
+                    assert "这是一条未送达的开头" in name
+                    update(session, "模型收到了未送达的开头作为上下文")
                 elif name == "待发图片":
                     images = [block for block in params["prompt"] if block.get("type") == "image"]
                     assert len(images) == 1 and len(images[0]["data"]) > 100, "待发图片没有作为图片发送"
@@ -1859,6 +2071,14 @@ final class StudioSessionTests: XCTestCase {
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
                     update(session, "丙开始")
                     time.sleep(8)
+                elif name in ("自动插入原任务", "插入回执验证"):
+                    update(session, "开始处理。")
+                    expected = ("自动插入补充一", "自动插入补充二") if name == "自动插入原任务" else ("插入回执不明",)
+                    until = time.monotonic() + 6
+                    while not all((soul.parent / item).exists() for item in expected):
+                        assert time.monotonic() < until, "未收到自动插入"
+                        time.sleep(0.025)
+                    update(session, "原任务收到两条补充。" if len(expected) == 2 else "原任务已结束。")
                 elif name.startswith("用户请你为助手"):
                     update(session, "准备交接的过程说明")
                     send(method="session/update", params={"sessionId": session, "update": {

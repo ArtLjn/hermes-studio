@@ -82,6 +82,7 @@ public struct Message: Codable, Identifiable, Equatable, Sendable {
     public var isGuidance: Bool?
     public var workDuration: TimeInterval?
     public var interrupted: Bool?
+    public var notSent: Bool?
     public var continuationOf: UUID?
     public var handoff: RoleHandoff?
     public var consultation: RoleConsultation?

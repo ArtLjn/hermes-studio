@@ -7,6 +7,8 @@ struct ChatTurnRow: View {
     let store: RoleStore
     let roleID: UUID
     let activity: String?
+    var restoreRequest: (() -> Void)? = nil
+    var canRestoreRequest = false
     @State private var showingProcess: Bool?
 
     var body: some View {
@@ -16,6 +18,21 @@ struct ChatTurnRow: View {
         let execution = content.process
         VStack(alignment: .leading, spacing: 15) {
             if let request = turn.request { row(request) }
+            if !running, turn.request?.notSent == true || restoreRequest != nil {
+                HStack(spacing: 8) {
+                    if turn.request?.notSent == true {
+                        Label("未发送", systemImage: "exclamationmark.circle")
+                    }
+                    if let restoreRequest {
+                        Button("重新编辑", action: restoreRequest)
+                            .buttonStyle(.link)
+                            .disabled(!canRestoreRequest)
+                    }
+                }
+                .font(.system(size: 11))
+                .foregroundStyle(StudioPalette.muted)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            }
             if !execution.isEmpty {
                 if running || hasInsertion {
                     process(execution)

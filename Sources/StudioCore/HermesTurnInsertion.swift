@@ -1,5 +1,18 @@
 import Foundation
 
+enum HermesInsertionError: LocalizedError {
+    case ended, unavailable, rejected, unconfirmed
+
+    var errorDescription: String? {
+        switch self {
+        case .ended: "当前回合已经结束。"
+        case .unavailable: "当前回合的插入接口不可用。"
+        case .rejected: "Hermes 确认未接收插入。"
+        case .unconfirmed: "未收到 Hermes 的插入确认，待发队列已暂停。请先确认当前回复是否已收到补充。"
+        }
+    }
+}
+
 extension HermesRuntime {
     public func insertIntoRunningTurn(_ text: String, sessionID: String, home: URL) async throws {
         try await withCheckedThrowingContinuation { continuation in
@@ -15,18 +28,14 @@ extension HermesRuntime {
     }
 
     private func performInsertion(_ text: String, sessionID: String, home: URL) throws {
-        let outcome: Substring?
-        do {
-            outcome = try gatewayOperation(Self.insertionProgram,
-                request: ["session": sessionID, "text": text], home: home)
-        } catch CapturedCommandError.timedOut {
-            throw StudioError.message("Hermes 插入确认超时。消息仍在输入框，请先查看当前回复是否已收到补充。")
-        }
+        let outcome = try? gatewayOperation(Self.insertionProgram,
+            request: ["session": sessionID, "text": text], home: home)
         switch outcome {
         case "accepted": return
-        case "ended": throw StudioError.message("当前回合已经结束，消息仍在输入框。")
-        case "rejected": throw StudioError.message("Hermes 未能把消息插入当前回合，消息仍在输入框。")
-        default: throw StudioError.message("无法确认 Hermes 当前回合的插入结果，消息仍在输入框。")
+        case "ended": throw HermesInsertionError.ended
+        case "unavailable": throw HermesInsertionError.unavailable
+        case "rejected": throw HermesInsertionError.rejected
+        default: throw HermesInsertionError.unconfirmed
         }
     }
 
@@ -70,7 +79,7 @@ extension HermesRuntime {
         import asyncio, json, sys
         from pathlib import Path
         from hermes_constants import get_hermes_home
-        from hermes_cli.gateway_client import connect_gateway, GatewayRPCError
+        from hermes_cli.gateway_client import connect_gateway, GatewayClientError, GatewayRPCError
         from hermes_cli.gateway_runtime import attachable, discover_gateway_endpoint
 
         async def execute(request, operation):
@@ -93,14 +102,30 @@ extension HermesRuntime {
             session = request["session"]
             try:
                 state = await client.rpc("session.resume", session_id=session, omit_messages=True, _timeout=4)
-                if not state.get("running") or state.get("session_id") != session:
-                    return "ended"
-                # 后端校验执行代数，回合在查询后结束时会拒绝这条插入。
-                reply = await client.rpc("session.redirect", session_id=session, text=request["text"],
-                                         execution_generation=state["execution_generation"], _timeout=4)
-                return "accepted" if reply.get("status") == "redirected" else "rejected"
             except GatewayRPCError as error:
-                return "ended" if str(error) in {"not_found", "stale_generation"} else "rejected"
+                return "ended" if str(error) == "not_found" else "unavailable"
+            except (GatewayClientError, TimeoutError):
+                return "unavailable"
+            if not state.get("running") or state.get("session_id") != session:
+                return "ended"
+            generation = state.get("execution_generation")
+            if type(generation) is not int:
+                return "unavailable"
+            try:
+                reply = await client.rpc("session.redirect", session_id=session, text=request["text"],
+                                         execution_generation=generation, _timeout=4)
+            except GatewayRPCError as error:
+                if str(error) in {"not_found", "stale_generation"}:
+                    return "ended"
+                if error.code in {-32601, 4010} or str(error) in {"unknown_method", "unsupported_control", "execution_not_ready"}:
+                    return "unavailable"
+                return "unconfirmed"
+            if reply.get("status") == "redirected":
+                return "accepted"
+            # 部分 Hermes 版本可能已经接收文字后才返回拒绝。只有明确未交付时才能重发。
+            if reply.get("status") == "rejected" and reply.get("delivered") is False:
+                return "rejected"
+            return "unconfirmed"
 
         respond(insert)
         """

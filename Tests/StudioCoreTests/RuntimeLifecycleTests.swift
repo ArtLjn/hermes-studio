@@ -4,6 +4,13 @@ import XCTest
 @testable import StudioCore
 
 final class RuntimeLifecycleTests: XCTestCase {
+    func testSessionSetupCanWaitForTheLocalGateway() {
+        XCTAssertEqual(ACPConnection.requestTimeout(for: "session/new"), .seconds(90))
+        XCTAssertEqual(ACPConnection.requestTimeout(for: "session/load"), .seconds(90))
+        XCTAssertEqual(ACPConnection.requestTimeout(for: "initialize"), .seconds(30))
+        XCTAssertEqual(ACPConnection.requestTimeout(for: "session/set_config_option"), .seconds(30))
+    }
+
     func testTemporaryTaskWaitsForLateGatewayAndRetiresItBeforeRemovingDirectory() throws {
         let lifetime = HermesProcessLifetime()
         let (home, process) = try gateway(busy: true, startupDelay: 0.4)

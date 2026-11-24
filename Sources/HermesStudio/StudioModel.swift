@@ -32,6 +32,25 @@ enum RoleCollaborationMode: CaseIterable, Identifiable {
 
 @MainActor
 final class StudioModel: ObservableObject {
+    struct RunningConversation: Identifiable {
+        enum Status {
+            case running, awaitingApproval, stopping
+
+            var label: String {
+                switch self {
+                case .running: "正在处理"
+                case .awaitingApproval: "等待授权"
+                case .stopping: "正在停止"
+                }
+            }
+        }
+
+        let id: UUID
+        let title: String
+        let role: Role
+        let status: Status
+    }
+
     struct QueuedMessage: Identifiable {
         let id = UUID()
         let text: String
@@ -60,17 +79,31 @@ final class StudioModel: ObservableObject {
         let entries: [RoleConsultation.ContextEntry]
     }
 
+    private struct PendingInsertion {
+        let id: UUID
+        let outputIndex: Int
+    }
+
     private struct RunningTurn {
+        let roleID: UUID
+        let startedAt = ContinuousClock.now
         let control: TurnControl
         let approval: HermesApprovalMode?
         let preparingHandoff: Bool
         var activity = "正在提交消息"
         var stopping = false
-        var insertion: UUID?
+        var insertionReady = false
+        var insertion: PendingInsertion?
+        var defersQueuedInsertion = false
         var permissions: [ToolPermission] = []
         var consultationID: UUID?
         var consultationText = ""
         var recallingGroup = false
+
+        var status: RunningConversation.Status {
+            if stopping { return .stopping }
+            return permissions.isEmpty ? .running : .awaitingApproval
+        }
     }
 
     @Published private(set) var roles: [Role] = []
@@ -116,6 +149,7 @@ final class StudioModel: ObservableObject {
         .appendingPathComponent("hermes-studio-group-recall-\(UUID())", isDirectory: true))
     private var backend: HermesRuntime?
     private var runtimeRevision = UUID()
+    private var skillScan: Task<Void, Never>?
     private var draftContext = UUID()
     private var composerContexts: [ComposerScope: UUID] = [:]
     private var drafts: [ComposerScope: ComposerDraft] = [:]
@@ -208,18 +242,24 @@ final class StudioModel: ObservableObject {
     var conversation: Conversation? { threads.first { $0.id == conversationID } }
     private var currentTurn: RunningTurn? { conversationID.flatMap { runningTurns[$0] } }
     func isGenerating(_ id: UUID) -> Bool { runningTurns[id] != nil }
+    func runningConversationStatus(_ id: UUID) -> RunningConversation.Status? { runningTurns[id]?.status }
+    var runningConversations: [RunningConversation] {
+        runningTurns.sorted { $0.value.startedAt < $1.value.startedAt }.compactMap { id, turn in
+            guard let role = roles.first(where: { $0.id == turn.roleID }),
+                let thread = conversations[role.id]?.first(where: { $0.id == id && $0.archivedAt == nil }) else { return nil }
+            return RunningConversation(id: id, title: thread.title, role: role, status: turn.status)
+        }
+    }
     var isGeneratingHere: Bool { currentTurn != nil }
     var isPreparingHandoff: Bool { currentTurn?.preparingHandoff == true }
     var isConsultingHere: Bool { currentTurn?.consultationID != nil }
     var isStoppingHere: Bool { currentTurn?.stopping == true }
     var activePermission: ToolPermission? { isStoppingHere ? nil : currentTurn?.permissions.first }
-    var insertingMessage: UUID? { currentTurn?.insertion }
+    var insertingMessage: UUID? { currentTurn?.insertion?.id }
     var queuedMessages: [QueuedMessage] { conversationID.flatMap { replyQueues[$0] } ?? [] }
     var isReplyQueuePaused: Bool { conversationID.map { pausedQueues.contains($0) } ?? false }
     var canInsertQueuedMessage: Bool {
-        guard let turn = currentTurn else { return false }
-        return queuedMessages.first?.canInsert == true && !turn.stopping && turn.insertion == nil
-            && !turn.preparingHandoff && turn.consultationID == nil && !turn.recallingGroup
+        conversationID.map { canInsertQueuedMessage(in: $0) } ?? false
     }
     var activity: String? { currentTurn?.activity }
     var pendingImages: Int { imageImports[draftContext, default: 0] }
@@ -231,9 +271,13 @@ final class StudioModel: ObservableObject {
         return turn
     }
     var canContinueReply: Bool {
-        backend != nil && !loadingRunSettings && pendingImages == 0 && selectedHandoffTargetID == nil
-            && selectedSkill == nil && images.isEmpty && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !terminating && backend != nil && canRestoreMessage
             && interruptedTurn != nil
+    }
+    var hasUnsentReply: Bool { interruptedTurn?.request?.notSent == true }
+    var canRestoreMessage: Bool {
+        !terminating && !isGeneratingHere && !loadingRunSettings && pendingImages == 0 && selectedHandoffTargetID == nil
+            && selectedSkill == nil && images.isEmpty && draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     var canSend: Bool {
         !terminating && !isStoppingHere && (!isGeneratingHere && queuedMessages.isEmpty || selectedHandoffTargetID == nil)
@@ -420,6 +464,8 @@ final class StudioModel: ObservableObject {
         guard canRefreshRuntime else { return }
         let revision = UUID()
         runtimeRevision = revision
+        skillScan?.cancel()
+        skillScan = nil
         preparedSessions.removeAll()
         runSettingsFailures.removeAll()
         runSettingsBySession.removeAll()
@@ -434,14 +480,31 @@ final class StudioModel: ObservableObject {
             return
         }
         prewarm()
+        Task { await refreshSkillCatalog() }
         Task {
-            let discovered = await Task.detached { (try? runtime.currentModel(), runtime.installedSkills(), runtime.terminalHome()) }.value
+            let discovered = await Task.detached { (try? runtime.currentModel(), runtime.terminalHome()) }.value
             if runtimeRevision == revision {
                 modelName = discovered.0 ?? ""
-                skills = discovered.1
-                terminalHome = discovered.2
+                terminalHome = discovered.1
             }
         }
+    }
+
+    func refreshSkillCatalog() async {
+        if let skillScan {
+            await skillScan.value
+            return
+        }
+        guard let backend else { return }
+        let revision = runtimeRevision
+        let scan = Task {
+            let found = await Task.detached { backend.installedSkills() }.value
+            guard runtimeRevision == revision else { return }
+            if skills != found { skills = found }
+            skillScan = nil
+        }
+        skillScan = scan
+        await scan.value
     }
 
     func select(_ role: Role) {
@@ -790,6 +853,23 @@ final class StudioModel: ObservableObject {
         return group
     }
 
+    func renameLibraryGroup(_ currentName: String, to input: String) throws -> String {
+        let renamed = try store.renameLibraryGroup(currentName, to: input)
+        guard renamed != currentName else { return renamed }
+        func updateGroup(in members: [Role]) -> [Role] {
+            members.map { member in
+                guard member.libraryGroup == currentName else { return member }
+                var updated = member
+                updated.libraryGroup = renamed
+                return updated
+            }
+        }
+        roles = updateGroup(in: roles)
+        archivedRoles = updateGroup(in: archivedRoles)
+        libraryGroups = libraryGroups.map { $0 == currentName ? renamed : $0 }
+        return renamed
+    }
+
     @discardableResult
     func dissolveLibraryGroup(_ name: String) -> Bool {
         do {
@@ -892,22 +972,51 @@ final class StudioModel: ObservableObject {
     }
 
     func continueReply() {
-        guard canContinueReply, let backend, var thread = conversation,
-            let request = interruptedTurn?.request,
+        guard canContinueReply, let request = interruptedTurn?.request else { return }
+        retryReply(request)
+    }
+
+    @discardableResult
+    func restoreUnansweredMessage(_ id: UUID) -> Bool {
+        guard canRestoreMessage, let thread = conversation,
+            let turn = ChatTurn.collect(thread.messages).first(where: { $0.id == id }),
+            turn.canRestoreRequest, let request = turn.request else { return false }
+        do {
+            let content = try restoredContent(of: request, roleID: thread.roleID)
+            restoreDraft(ComposerDraft(text: request.text, images: content.images, skill: content.skill))
+            error = nil
+            return true
+        } catch {
+            report(error)
+            return false
+        }
+    }
+
+    private func restoredContent(of request: Message, roleID: UUID) throws -> (images: [ImagePayload], skill: HermesSkill?) {
+        let attachments = try (request.images ?? []).map { image in
+            try ImagePayload.prepare(name: image.name, data: Data(contentsOf: store.imageURL(image, for: roleID)))
+        }
+        let skill = availableSkills.first { $0.name == request.skill }
+        if request.skill != nil, skill == nil {
+            throw StudioError.message("原消息选择的技能已不可用。")
+        }
+        return (attachments, skill)
+    }
+
+    private func retryReply(_ request: Message) {
+        guard let backend, var thread = conversation,
             let requestIndex = thread.messages.firstIndex(where: { $0.id == request.id }),
             validateWorkspace() else { return }
         let sourceIndex = request.continuationOf.flatMap { id in thread.messages.firstIndex { $0.id == id } } ?? requestIndex
         let source = thread.messages[sourceIndex]
         do {
-            let attachments = try (source.images ?? []).map { image in
-                try ImagePayload.prepare(name: image.name, data: Data(contentsOf: store.imageURL(image, for: thread.roleID)))
-            }
-            let skill = availableSkills.first { $0.name == source.skill }
+            let (attachments, skill) = try restoredContent(of: source, roleID: thread.roleID)
             var context = thread
             context.messages = Array(thread.messages.prefix(sourceIndex))
             let input = requestInput(source.text, in: context, hasImages: !attachments.isEmpty, skill: skill,
                 workspace: project?.directory)
             thread.messages[requestIndex].usedGroupRecall = input.recallsGroup ? true : nil
+            restoreDraft(ComposerDraft())
             error = nil
             startTurn(in: thread, backend: backend, text: input.prompt,
                 images: attachments, skill: skill, workspace: project?.directory, skillIDs: role?.skillIDs,
@@ -946,6 +1055,11 @@ final class StudioModel: ObservableObject {
             }
             return
         }
+        if text.trimmingCharacters(in: .punctuationCharacters) == "继续", images.isEmpty, selectedSkill == nil,
+            let request = interruptedTurn?.request, request.notSent == true {
+            retryReply(request)
+            return
+        }
         if let thread = conversation, isGeneratingHere || !queuedMessages.isEmpty {
             guard queuedMessages.count < 20 else {
                 error = "待发队列最多保留 20 条消息，当前草稿已保留。"
@@ -962,24 +1076,57 @@ final class StudioModel: ObservableObject {
     }
 
     func removeQueuedMessage(_ id: UUID) {
-        guard let threadID = conversationID, insertingMessage != id else { return }
-        removeQueuedMessage(id, from: threadID)
+        guard let thread = conversation, insertingMessage != id else { return }
+        removeQueuedMessage(id, from: thread.id)
+        sendNextQueuedMessage(in: thread)
     }
 
     func insertQueuedMessage() {
-        guard canInsertQueuedMessage, let threadID = conversationID, let turn = currentTurn,
-            let message = queuedMessages.first else { return }
-        guard turn.control.insert(id: message.id, text: message.text) else {
-            error = "当前回合暂时无法接收补充，消息仍在队列中。"
-            return
+        guard let thread = conversation, canInsertQueuedMessage else { return }
+        if insertQueuedMessage(in: thread, automatically: false) { error = nil }
+        else { error = "当前回合暂时无法接收补充，消息仍在队列中。" }
+    }
+
+    private func canInsertQueuedMessage(in threadID: UUID) -> Bool {
+        guard !terminating, !pausedQueues.contains(threadID), let turn = runningTurns[threadID],
+            replyQueues[threadID]?.first?.canInsert == true else { return false }
+        return turn.insertionReady && !turn.stopping && turn.insertion == nil && !turn.defersQueuedInsertion
+            && turn.permissions.isEmpty && !turn.preparingHandoff && turn.consultationID == nil && !turn.recallingGroup
+    }
+
+    @discardableResult
+    private func insertQueuedMessage(in thread: Conversation, automatically: Bool) -> Bool {
+        guard canInsertQueuedMessage(in: thread.id), let turn = runningTurns[thread.id],
+            let message = replyQueues[thread.id]?.first else { return false }
+        if automatically {
+            let workspace = projects(for: thread.roleID).first { $0.id == thread.projectID }?.directory
+            let input = requestInput(message.text, in: thread, hasImages: false, skill: nil, workspace: workspace)
+            guard input.prompt == message.text else { return false }
         }
-        runningTurns[threadID]?.insertion = message.id
-        error = nil
+        guard turn.control.insert(id: message.id, text: message.text) else { return false }
+        runningTurns[thread.id]?.insertion = PendingInsertion(id: message.id, outputIndex: thread.messages.count)
+        return true
+    }
+
+    private func deferQueuedInsertion(_ id: UUID, in thread: inout Conversation) -> Bool {
+        guard let insertion = runningTurns[thread.id]?.insertion, insertion.id == id else { return false }
+        runningTurns[thread.id]?.insertion = nil
+        runningTurns[thread.id]?.defersQueuedInsertion = true
+        let index = insertion.outputIndex
+        if index > 0, thread.messages.indices.contains(index), thread.messages[index - 1].author == .assistant,
+            thread.messages[index].author == .assistant, thread.messages[index].images?.isEmpty != false,
+            thread.messages[index - 1].remoteID == thread.messages[index].remoteID {
+            let continuation = thread.messages.remove(at: index)
+            thread.messages[index - 1].text += continuation.text
+            publish(thread)
+        }
+        return true
     }
 
     func resumeReplyQueue() {
-        guard let thread = conversation else { return }
+        guard let thread = conversation, !isStoppingHere else { return }
         pausedQueues.remove(thread.id)
+        conversationErrors[thread.id] = nil
         error = nil
         sendNextQueuedMessage(in: thread)
     }
@@ -997,8 +1144,12 @@ final class StudioModel: ObservableObject {
     }
 
     private func sendNextQueuedMessage(in thread: Conversation) {
-        guard !terminating, !isGenerating(thread.id), !pausedQueues.contains(thread.id), thread.archivedAt == nil,
+        guard !terminating, !pausedQueues.contains(thread.id), thread.archivedAt == nil,
             let next = replyQueues[thread.id]?.first else { return }
+        if isGenerating(thread.id) {
+            insertQueuedMessage(in: thread, automatically: true)
+            return
+        }
         do {
             guard let backend, let role = roles.first(where: { $0.id == thread.roleID }) else {
                 throw StudioError.message("助手或 Hermes 不可用，消息仍在队列中。")
@@ -1047,14 +1198,17 @@ final class StudioModel: ObservableObject {
             isQuestion: handoff.isQuestion == true)
     }
 
-    func openHandoffConversation(_ id: UUID, roleID: UUID) {
+    @discardableResult
+    func openConversation(_ id: UUID, roleID: UUID) -> Bool {
         guard let role = roles.first(where: { $0.id == roleID }),
-            activeThreads(for: roleID).contains(where: { $0.id == id }) else {
-            error = "交接会话已不可用。"
-            return
-        }
+            conversations[roleID]?.contains(where: { $0.id == id && $0.archivedAt == nil }) == true else { return false }
         selectedThreads[roleID] = id
         select(role)
+        return true
+    }
+
+    func openHandoffConversation(_ id: UUID, roleID: UUID) {
+        if !openConversation(id, roleID: roleID) { error = "交接会话已不可用。" }
     }
 
     func sendHandoff(_ review: RoleHandoffReview) {
@@ -1205,7 +1359,7 @@ final class StudioModel: ObservableObject {
         }
         let control = TurnControl()
         let requestID = thread.messages[index].id
-        runningTurns[threadID] = RunningTurn(control: control, approval: nil, preparingHandoff: false,
+        runningTurns[threadID] = RunningTurn(roleID: thread.roleID, control: control, approval: nil, preparingHandoff: false,
             activity: "\(target.name)正在回答", consultationID: requestID)
         conversationErrors[threadID] = nil
         error = nil
@@ -1253,10 +1407,12 @@ final class StudioModel: ObservableObject {
     func respond(to permission: ToolPermission, option: String?) {
         guard let id = conversationID, let turn = runningTurns[id],
             turn.permissions.contains(where: { $0.id == permission.id }) else { return }
-        if !turn.control.respond(to: permission.id, optionID: option) {
+        let responded = turn.control.respond(to: permission.id, optionID: option)
+        if !responded {
             error = "这条审核请求已失效。"
         }
         runningTurns[id]?.permissions.removeAll { $0.id == permission.id }
+        if responded, let conversation { sendNextQueuedMessage(in: conversation) }
     }
 
     private func validateWorkspace() -> Bool {
@@ -1293,7 +1449,15 @@ final class StudioModel: ObservableObject {
         }
         let withRoles = RoleDirectoryEntry.promptForMentions(in: text, roles: roles, caller: thread.roleID)
         if let consultation { return ("\(withRoles)\n\n\(consultation)", false, false) }
-        return (text.hasPrefix("/") ? withRoles : GroupChatRecall.withPreviousReplies(withRoles, messages: thread.messages), false, true)
+        guard !text.hasPrefix("/") else { return (withRoles, false, true) }
+        let previous = thread.messages.reversed().prefix { $0.notSent == true }.reversed()
+            .map(\.text).filter { !$0.isEmpty }
+        let prompt = GroupChatRecall.withPreviousReplies(withRoles, messages: thread.messages)
+        guard !previous.isEmpty else { return (prompt, false, true) }
+        let quoted = previous.map { text in
+            text.split(separator: "\n", omittingEmptySubsequences: false).map { "> \($0)" }.joined(separator: "\n")
+        }.joined(separator: "\n\n")
+        return ("\(prompt)\n\n这是刚才未送达的用户消息，仅作前文引用。请按当前消息决定需要做什么。\n\n\(quoted)", false, true)
     }
 
     @discardableResult
@@ -1361,7 +1525,7 @@ final class StudioModel: ObservableObject {
         let control = TurnControl()
         let recalling = thread.messages[requestIndex].usedGroupRecall == true
         let activity = recalling ? "正在回顾群聊" : handoff.map { $0.isQuestion == true ? "正在拟问题" : "正在整理交接摘要" } ?? "正在提交消息"
-        runningTurns[threadID] = RunningTurn(control: control, approval: recalling ? nil : runPreferences.approval,
+        runningTurns[threadID] = RunningTurn(roleID: targetRoleID, control: control, approval: recalling ? nil : runPreferences.approval,
             preparingHandoff: handoff != nil, activity: activity, recallingGroup: recalling)
         conversationErrors[threadID] = nil
         publish(thread)
@@ -1400,6 +1564,7 @@ final class StudioModel: ObservableObject {
             var completedHandoff = false
             var completed = false
             var interrupted = false
+            var failedBeforePrompt = false
             var recallText = ""
             var recallRequestedTool = false
             for await event in events {
@@ -1426,7 +1591,8 @@ final class StudioModel: ObservableObject {
                     runningTurns[threadID]?.activity = "正在回复"
                     if recalling { recallText += text }
                     let visible = recalling ? TextOnlyReply.parse(recallText, streaming: true).text : text
-                    if let last = thread.messages.indices.last, last >= outputStart,
+                    let followsInsertion = runningTurns[threadID]?.insertion?.outputIndex == thread.messages.count
+                    if let last = thread.messages.indices.last, last >= outputStart, !followsInsertion,
                         thread.messages[last].author == .assistant, recalling || thread.messages[last].remoteID == id {
                         if recalling { thread.messages[last].text = visible }
                         else { thread.messages[last].text += visible }
@@ -1457,23 +1623,30 @@ final class StudioModel: ObservableObject {
                 case .permission(let permission):
                     guard !control.isCancelled else { continue }
                     runningTurns[threadID]?.permissions.append(permission)
+                    runningTurns[threadID]?.insertionReady = true
                 case .permissionExpired(let toolID):
                     runningTurns[threadID]?.permissions.removeAll { $0.toolID == toolID }
+                    sendNextQueuedMessage(in: thread)
                 case .followUpReady, .followUpStarted, .followUpRejected:
                     break
+                case .insertionReady:
+                    runningTurns[threadID]?.insertionReady = true
+                    sendNextQueuedMessage(in: thread)
                 case .insertionAccepted(let id, let text):
-                    guard id == runningTurns[threadID]?.insertion else { continue }
+                    guard let insertion = runningTurns[threadID]?.insertion, id == insertion.id else { continue }
                     var message = Message(.user, text)
                     message.id = id
                     message.isGuidance = true
-                    thread.messages.append(message)
+                    thread.messages.insert(message, at: insertion.outputIndex)
                     removeQueuedMessage(id, from: threadID)
                     runningTurns[threadID]?.insertion = nil
                     publish(thread)
                     persist(thread)
+                    if conversationErrors[threadID] == nil { sendNextQueuedMessage(in: thread) }
+                case .insertionDeferred(let id):
+                    _ = deferQueuedInsertion(id, in: &thread)
                 case .insertionFailed(let id, let reason):
-                    guard id == runningTurns[threadID]?.insertion else { continue }
-                    runningTurns[threadID]?.insertion = nil
+                    guard deferQueuedInsertion(id, in: &thread) else { continue }
                     conversationErrors[threadID] = reason
                     pauseQueue(threadID)
                 case .activity(let title):
@@ -1499,6 +1672,10 @@ final class StudioModel: ObservableObject {
                     }
                 case .failed(let message):
                     conversationErrors[threadID] = message
+                    if !recalling, handoff == nil, !control.hasStartedPrompt {
+                        interrupted = true
+                        failedBeforePrompt = true
+                    }
                 }
             }
             if recallRequestedTool {
@@ -1507,6 +1684,8 @@ final class StudioModel: ObservableObject {
             }
             finishRequest(in: &thread, at: requestIndex, outputStart: outputStart, started: start)
             thread.messages[requestIndex].interrupted = interrupted
+            if failedBeforePrompt { thread.messages[requestIndex].notSent = true }
+            else if control.hasStartedPrompt { thread.messages[requestIndex].notSent = nil }
             if completedHandoff, conversationErrors[threadID] == nil {
                 let output = thread.messages.dropFirst(requestIndex + 1)
                 let lastAction = output.lastIndex { $0.tool != nil || $0.isGuidance == true }

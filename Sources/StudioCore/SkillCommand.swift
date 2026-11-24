@@ -3,6 +3,7 @@ import Foundation
 public struct SkillCommand: Equatable, Sendable {
     public let range: NSRange
     public let query: String
+    public let isExplicit: Bool
 
     public static func atCaret(_ caret: Int, in text: String) -> Self? {
         let source = text as NSString
@@ -14,11 +15,11 @@ public struct SkillCommand: Equatable, Sendable {
             let offset = (line as NSString).range(of: "/").location
             let start = caret - (line as NSString).length + offset
             return Self(range: NSRange(location: start, length: caret - start),
-                query: String(leading.dropFirst(6)).trimmingCharacters(in: .whitespaces))
+                query: String(leading.dropFirst(6)).trimmingCharacters(in: .whitespaces), isExplicit: true)
         }
         let token = line.split(omittingEmptySubsequences: false, whereSeparator: \.isWhitespace).last ?? ""
         guard token.hasPrefix("/"), token.dropFirst().allSatisfy({ $0.isLetter || $0.isNumber || "-_".contains($0) }) else { return nil }
         let length = (token as NSString).length
-        return Self(range: NSRange(location: caret - length, length: length), query: String(token.dropFirst()))
+        return Self(range: NSRange(location: caret - length, length: length), query: String(token.dropFirst()), isExplicit: false)
     }
 }
